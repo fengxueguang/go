@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"compress/bzip2"
 	"fmt"
+	"internal/testenv"
 	"io"
 	"os"
 	"path/filepath"
@@ -51,8 +52,8 @@ import (
 // submatch indices. An unmatched subexpression formats
 // its pair as a single - (not illustrated above).  For now
 // each regexp run produces two match results, one for a
-// ``full match'' that restricts the regexp to matching the entire
-// string or nothing, and one for a ``partial match'' that gives
+// “full match” that restricts the regexp to matching the entire
+// string or nothing, and one for a “partial match” that gives
 // the leftmost first match found in the string.
 //
 // Lines beginning with # are comments. Lines beginning with
@@ -61,7 +62,6 @@ import (
 //
 // At time of writing, re2-exhaustive.txt is 59 MB but compresses to 385 kB,
 // so we store re2-exhaustive.txt.bz2 in the repository and decompress it on the fly.
-//
 func TestRE2Search(t *testing.T) {
 	testRE2(t, "testdata/re2-search.txt")
 }
@@ -293,12 +293,9 @@ func parseResult(t *testing.T, file string, lineno int, res string) []int {
 				out[n] = -1
 				out[n+1] = -1
 			} else {
-				k := strings.Index(pair, "-")
-				if k < 0 {
-					t.Fatalf("%s:%d: invalid pair %s", file, lineno, pair)
-				}
-				lo, err1 := strconv.Atoi(pair[:k])
-				hi, err2 := strconv.Atoi(pair[k+1:])
+				loStr, hiStr, _ := strings.Cut(pair, "-")
+				lo, err1 := strconv.Atoi(loStr)
+				hi, err2 := strconv.Atoi(hiStr)
 				if err1 != nil || err2 != nil || lo > hi {
 					t.Fatalf("%s:%d: invalid pair %s", file, lineno, pair)
 				}
@@ -456,12 +453,11 @@ Reading:
 				continue Reading
 			}
 		case ':':
-			i := strings.Index(flag[1:], ":")
-			if i < 0 {
+			var ok bool
+			if _, flag, ok = strings.Cut(flag[1:], ":"); !ok {
 				t.Logf("skip: %s", line)
 				continue Reading
 			}
-			flag = flag[1+i+1:]
 		case 'C', 'N', 'T', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 			t.Logf("skip: %s", line)
 			continue Reading
@@ -658,57 +654,71 @@ func makeText(n int) []byte {
 	return text
 }
 
-func benchmark(b *testing.B, re string, n int) {
-	r := MustCompile(re)
-	t := makeText(n)
-	b.ResetTimer()
-	b.SetBytes(int64(n))
-	for i := 0; i < b.N; i++ {
-		if r.Match(t) {
-			b.Fatal("match!")
+func BenchmarkMatch(b *testing.B) {
+	isRaceBuilder := strings.HasSuffix(testenv.Builder(), "-race")
+
+	for _, data := range benchData {
+		r := MustCompile(data.re)
+		for _, size := range benchSizes {
+			if (isRaceBuilder || testing.Short()) && size.n > 1<<10 {
+				continue
+			}
+			t := makeText(size.n)
+			b.Run(data.name+"/"+size.name, func(b *testing.B) {
+				b.SetBytes(int64(size.n))
+				for i := 0; i < b.N; i++ {
+					if r.Match(t) {
+						b.Fatal("match!")
+					}
+				}
+			})
 		}
 	}
 }
 
-const (
-	easy0  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ$"
-	easy0i = "(?i)ABCDEFGHIJklmnopqrstuvwxyz$"
-	easy1  = "A[AB]B[BC]C[CD]D[DE]E[EF]F[FG]G[GH]H[HI]I[IJ]J$"
-	medium = "[XYZ]ABCDEFGHIJKLMNOPQRSTUVWXYZ$"
-	hard   = "[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ$"
-	hard1  = "ABCD|CDEF|EFGH|GHIJ|IJKL|KLMN|MNOP|OPQR|QRST|STUV|UVWX|WXYZ"
-)
+func BenchmarkMatch_onepass_regex(b *testing.B) {
+	isRaceBuilder := strings.HasSuffix(testenv.Builder(), "-race")
+	r := MustCompile(`(?s)\A.*\z`)
+	if r.onepass == nil {
+		b.Fatalf("want onepass regex, but %q is not onepass", r)
+	}
+	for _, size := range benchSizes {
+		if (isRaceBuilder || testing.Short()) && size.n > 1<<10 {
+			continue
+		}
+		t := makeText(size.n)
+		b.Run(size.name, func(b *testing.B) {
+			b.SetBytes(int64(size.n))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if !r.Match(t) {
+					b.Fatal("not match!")
+				}
+			}
+		})
+	}
+}
 
-func BenchmarkMatchEasy0_32(b *testing.B)   { benchmark(b, easy0, 32<<0) }
-func BenchmarkMatchEasy0_1K(b *testing.B)   { benchmark(b, easy0, 1<<10) }
-func BenchmarkMatchEasy0_32K(b *testing.B)  { benchmark(b, easy0, 32<<10) }
-func BenchmarkMatchEasy0_1M(b *testing.B)   { benchmark(b, easy0, 1<<20) }
-func BenchmarkMatchEasy0_32M(b *testing.B)  { benchmark(b, easy0, 32<<20) }
-func BenchmarkMatchEasy0i_32(b *testing.B)  { benchmark(b, easy0i, 32<<0) }
-func BenchmarkMatchEasy0i_1K(b *testing.B)  { benchmark(b, easy0i, 1<<10) }
-func BenchmarkMatchEasy0i_32K(b *testing.B) { benchmark(b, easy0i, 32<<10) }
-func BenchmarkMatchEasy0i_1M(b *testing.B)  { benchmark(b, easy0i, 1<<20) }
-func BenchmarkMatchEasy0i_32M(b *testing.B) { benchmark(b, easy0i, 32<<20) }
-func BenchmarkMatchEasy1_32(b *testing.B)   { benchmark(b, easy1, 32<<0) }
-func BenchmarkMatchEasy1_1K(b *testing.B)   { benchmark(b, easy1, 1<<10) }
-func BenchmarkMatchEasy1_32K(b *testing.B)  { benchmark(b, easy1, 32<<10) }
-func BenchmarkMatchEasy1_1M(b *testing.B)   { benchmark(b, easy1, 1<<20) }
-func BenchmarkMatchEasy1_32M(b *testing.B)  { benchmark(b, easy1, 32<<20) }
-func BenchmarkMatchMedium_32(b *testing.B)  { benchmark(b, medium, 32<<0) }
-func BenchmarkMatchMedium_1K(b *testing.B)  { benchmark(b, medium, 1<<10) }
-func BenchmarkMatchMedium_32K(b *testing.B) { benchmark(b, medium, 32<<10) }
-func BenchmarkMatchMedium_1M(b *testing.B)  { benchmark(b, medium, 1<<20) }
-func BenchmarkMatchMedium_32M(b *testing.B) { benchmark(b, medium, 32<<20) }
-func BenchmarkMatchHard_32(b *testing.B)    { benchmark(b, hard, 32<<0) }
-func BenchmarkMatchHard_1K(b *testing.B)    { benchmark(b, hard, 1<<10) }
-func BenchmarkMatchHard_32K(b *testing.B)   { benchmark(b, hard, 32<<10) }
-func BenchmarkMatchHard_1M(b *testing.B)    { benchmark(b, hard, 1<<20) }
-func BenchmarkMatchHard_32M(b *testing.B)   { benchmark(b, hard, 32<<20) }
-func BenchmarkMatchHard1_32(b *testing.B)   { benchmark(b, hard1, 32<<0) }
-func BenchmarkMatchHard1_1K(b *testing.B)   { benchmark(b, hard1, 1<<10) }
-func BenchmarkMatchHard1_32K(b *testing.B)  { benchmark(b, hard1, 32<<10) }
-func BenchmarkMatchHard1_1M(b *testing.B)   { benchmark(b, hard1, 1<<20) }
-func BenchmarkMatchHard1_32M(b *testing.B)  { benchmark(b, hard1, 32<<20) }
+var benchData = []struct{ name, re string }{
+	{"Easy0", "ABCDEFGHIJKLMNOPQRSTUVWXYZ$"},
+	{"Easy0i", "(?i)ABCDEFGHIJklmnopqrstuvwxyz$"},
+	{"Easy1", "A[AB]B[BC]C[CD]D[DE]E[EF]F[FG]G[GH]H[HI]I[IJ]J$"},
+	{"Medium", "[XYZ]ABCDEFGHIJKLMNOPQRSTUVWXYZ$"},
+	{"Hard", "[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ$"},
+	{"Hard1", "ABCD|CDEF|EFGH|GHIJ|IJKL|KLMN|MNOP|OPQR|QRST|STUV|UVWX|WXYZ"},
+}
+
+var benchSizes = []struct {
+	name string
+	n    int
+}{
+	{"16", 16},
+	{"32", 32},
+	{"1K", 1 << 10},
+	{"32K", 32 << 10},
+	{"1M", 1 << 20},
+	{"32M", 32 << 20},
+}
 
 func TestLongest(t *testing.T) {
 	re, err := Compile(`a(|b)`)

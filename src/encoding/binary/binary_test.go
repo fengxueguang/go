@@ -6,11 +6,14 @@ package binary
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"math"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"unsafe"
 )
 
 type Struct struct {
@@ -27,6 +30,8 @@ type Struct struct {
 	Complex64  complex64
 	Complex128 complex128
 	Array      [4]uint8
+	Bool       bool
+	BoolArray  [4]bool
 }
 
 type T struct {
@@ -58,6 +63,9 @@ var s = Struct{
 	),
 
 	[4]uint8{0x43, 0x44, 0x45, 0x46},
+
+	true,
+	[4]bool{true, false, true, false},
 }
 
 var big = []byte{
@@ -76,6 +84,9 @@ var big = []byte{
 	51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
 
 	67, 68, 69, 70,
+
+	1,
+	1, 0, 1, 0,
 }
 
 var little = []byte{
@@ -94,12 +105,16 @@ var little = []byte{
 	58, 57, 56, 55, 54, 53, 52, 51, 66, 65, 64, 63, 62, 61, 60, 59,
 
 	67, 68, 69, 70,
+
+	1,
+	1, 0, 1, 0,
 }
 
 var src = []byte{1, 2, 3, 4, 5, 6, 7, 8}
 var res = []int32{0x01020304, 0x05060708}
+var putbuf = []byte{0, 0, 0, 0, 0, 0, 0, 0}
 
-func checkResult(t *testing.T, dir string, order ByteOrder, err error, have, want interface{}) {
+func checkResult(t *testing.T, dir string, order ByteOrder, err error, have, want any) {
 	if err != nil {
 		t.Errorf("%v %v: %v", dir, order, err)
 		return
@@ -109,13 +124,13 @@ func checkResult(t *testing.T, dir string, order ByteOrder, err error, have, wan
 	}
 }
 
-func testRead(t *testing.T, order ByteOrder, b []byte, s1 interface{}) {
+func testRead(t *testing.T, order ByteOrder, b []byte, s1 any) {
 	var s2 Struct
 	err := Read(bytes.NewReader(b), order, &s2)
 	checkResult(t, "Read", order, err, s2, s1)
 }
 
-func testWrite(t *testing.T, order ByteOrder, b []byte, s1 interface{}) {
+func testWrite(t *testing.T, order ByteOrder, b []byte, s1 any) {
 	buf := new(bytes.Buffer)
 	err := Write(buf, order, s1)
 	checkResult(t, "Write", order, err, buf.Bytes(), b)
@@ -141,8 +156,27 @@ func TestWriteSlice(t *testing.T) {
 	checkResult(t, "WriteSlice", BigEndian, err, buf.Bytes(), src)
 }
 
+func TestReadBool(t *testing.T) {
+	var res bool
+	var err error
+	err = Read(bytes.NewReader([]byte{0}), BigEndian, &res)
+	checkResult(t, "ReadBool", BigEndian, err, res, false)
+	res = false
+	err = Read(bytes.NewReader([]byte{1}), BigEndian, &res)
+	checkResult(t, "ReadBool", BigEndian, err, res, true)
+	res = false
+	err = Read(bytes.NewReader([]byte{2}), BigEndian, &res)
+	checkResult(t, "ReadBool", BigEndian, err, res, true)
+}
+
+func TestReadBoolSlice(t *testing.T) {
+	slice := make([]bool, 4)
+	err := Read(bytes.NewReader([]byte{0, 1, 2, 255}), BigEndian, slice)
+	checkResult(t, "ReadBoolSlice", BigEndian, err, slice, []bool{false, true, true, true})
+}
+
 // Addresses of arrays are easier to manipulate with reflection than are slices.
-var intArrays = []interface{}{
+var intArrays = []any{
 	&[100]int8{},
 	&[100]int16{},
 	&[100]int32{},
@@ -265,6 +299,58 @@ func TestBlankFields(t *testing.T) {
 	}
 }
 
+func TestSizeStructCache(t *testing.T) {
+	// Reset the cache, otherwise multiple test runs fail.
+	structSize = sync.Map{}
+
+	count := func() int {
+		var i int
+		structSize.Range(func(_, _ any) bool {
+			i++
+			return true
+		})
+		return i
+	}
+
+	var total int
+	added := func() int {
+		delta := count() - total
+		total += delta
+		return delta
+	}
+
+	type foo struct {
+		A uint32
+	}
+
+	type bar struct {
+		A Struct
+		B foo
+		C Struct
+	}
+
+	testcases := []struct {
+		val  any
+		want int
+	}{
+		{new(foo), 1},
+		{new(bar), 1},
+		{new(bar), 0},
+		{new(struct{ A Struct }), 1},
+		{new(struct{ A Struct }), 0},
+	}
+
+	for _, tc := range testcases {
+		if Size(tc.val) == -1 {
+			t.Fatalf("Can't get the size of %T", tc.val)
+		}
+
+		if n := added(); n != tc.want {
+			t.Errorf("Sizing %T added %d entries to the cache, want %d", tc.val, n, tc.want)
+		}
+	}
+}
+
 // An attempt to read into a struct with an unexported field will
 // panic. This is probably not the best choice, but at this point
 // anything else would be an API change.
@@ -291,7 +377,7 @@ func TestUnexportedRead(t *testing.T) {
 
 func TestReadErrorMsg(t *testing.T) {
 	var buf bytes.Buffer
-	read := func(data interface{}) {
+	read := func(data any) {
 		err := Read(&buf, LittleEndian, data)
 		want := "binary.Read: invalid type " + reflect.TypeOf(data).String()
 		if err == nil {
@@ -357,12 +443,124 @@ func testPutUint64SmallSliceLengthPanics() (panicked bool) {
 	return false
 }
 
+func TestByteOrder(t *testing.T) {
+	type byteOrder interface {
+		ByteOrder
+		AppendByteOrder
+	}
+	buf := make([]byte, 8)
+	for _, order := range []byteOrder{LittleEndian, BigEndian} {
+		const offset = 3
+		for _, value := range []uint64{
+			0x0000000000000000,
+			0x0123456789abcdef,
+			0xfedcba9876543210,
+			0xffffffffffffffff,
+			0xaaaaaaaaaaaaaaaa,
+			math.Float64bits(math.Pi),
+			math.Float64bits(math.E),
+		} {
+			want16 := uint16(value)
+			order.PutUint16(buf[:2], want16)
+			if got := order.Uint16(buf[:2]); got != want16 {
+				t.Errorf("PutUint16: Uint16 = %v, want %v", got, want16)
+			}
+			buf = order.AppendUint16(buf[:offset], want16)
+			if got := order.Uint16(buf[offset:]); got != want16 {
+				t.Errorf("AppendUint16: Uint16 = %v, want %v", got, want16)
+			}
+			if len(buf) != offset+2 {
+				t.Errorf("AppendUint16: len(buf) = %d, want %d", len(buf), offset+2)
+			}
+
+			want32 := uint32(value)
+			order.PutUint32(buf[:4], want32)
+			if got := order.Uint32(buf[:4]); got != want32 {
+				t.Errorf("PutUint32: Uint32 = %v, want %v", got, want32)
+			}
+			buf = order.AppendUint32(buf[:offset], want32)
+			if got := order.Uint32(buf[offset:]); got != want32 {
+				t.Errorf("AppendUint32: Uint32 = %v, want %v", got, want32)
+			}
+			if len(buf) != offset+4 {
+				t.Errorf("AppendUint32: len(buf) = %d, want %d", len(buf), offset+4)
+			}
+
+			want64 := uint64(value)
+			order.PutUint64(buf[:8], want64)
+			if got := order.Uint64(buf[:8]); got != want64 {
+				t.Errorf("PutUint64: Uint64 = %v, want %v", got, want64)
+			}
+			buf = order.AppendUint64(buf[:offset], want64)
+			if got := order.Uint64(buf[offset:]); got != want64 {
+				t.Errorf("AppendUint64: Uint64 = %v, want %v", got, want64)
+			}
+			if len(buf) != offset+8 {
+				t.Errorf("AppendUint64: len(buf) = %d, want %d", len(buf), offset+8)
+			}
+		}
+	}
+}
+
 func TestEarlyBoundsChecks(t *testing.T) {
 	if testUint64SmallSliceLengthPanics() != true {
 		t.Errorf("binary.LittleEndian.Uint64 expected to panic for small slices, but didn't")
 	}
 	if testPutUint64SmallSliceLengthPanics() != true {
 		t.Errorf("binary.LittleEndian.PutUint64 expected to panic for small slices, but didn't")
+	}
+}
+
+func TestReadInvalidDestination(t *testing.T) {
+	testReadInvalidDestination(t, BigEndian)
+	testReadInvalidDestination(t, LittleEndian)
+}
+
+func testReadInvalidDestination(t *testing.T, order ByteOrder) {
+	destinations := []any{
+		int8(0),
+		int16(0),
+		int32(0),
+		int64(0),
+
+		uint8(0),
+		uint16(0),
+		uint32(0),
+		uint64(0),
+
+		bool(false),
+	}
+
+	for _, dst := range destinations {
+		err := Read(bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), order, dst)
+		want := fmt.Sprintf("binary.Read: invalid type %T", dst)
+		if err == nil || err.Error() != want {
+			t.Fatalf("for type %T: got %q; want %q", dst, err, want)
+		}
+	}
+}
+
+func TestNoFixedSize(t *testing.T) {
+	type Person struct {
+		Age    int
+		Weight float64
+		Height float64
+	}
+
+	person := Person{
+		Age:    27,
+		Weight: 67.3,
+		Height: 177.8,
+	}
+
+	buf := new(bytes.Buffer)
+	err := Write(buf, LittleEndian, &person)
+	if err == nil {
+		t.Fatal("binary.Write: unexpected success as size of type *binary.Person is not fixed")
+	}
+	errs := "binary.Write: some values are not fixed-sized in type *binary.Person"
+	if err.Error() != errs {
+		t.Fatalf("got %q, want %q", err, errs)
 	}
 }
 
@@ -405,6 +603,14 @@ func BenchmarkReadStruct(b *testing.B) {
 	}
 }
 
+func BenchmarkWriteStruct(b *testing.B) {
+	b.SetBytes(int64(Size(&s)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		Write(io.Discard, BigEndian, &s)
+	}
+}
+
 func BenchmarkReadInts(b *testing.B) {
 	var ls Struct
 	bsr := &byteSliceReader{}
@@ -422,16 +628,15 @@ func BenchmarkReadInts(b *testing.B) {
 		Read(r, BigEndian, &ls.Uint32)
 		Read(r, BigEndian, &ls.Uint64)
 	}
-
+	b.StopTimer()
 	want := s
 	want.Float32 = 0
 	want.Float64 = 0
 	want.Complex64 = 0
 	want.Complex128 = 0
-	for i := range want.Array {
-		want.Array[i] = 0
-	}
-	b.StopTimer()
+	want.Array = [4]uint8{0, 0, 0, 0}
+	want.Bool = false
+	want.BoolArray = [4]bool{false, false, false, false}
 	if b.N > 0 && !reflect.DeepEqual(ls, want) {
 		b.Fatalf("struct doesn't match:\ngot  %v;\nwant %v", ls, want)
 	}
@@ -470,4 +675,193 @@ func BenchmarkWriteSlice1000Int32s(b *testing.B) {
 		Write(w, BigEndian, slice)
 	}
 	b.StopTimer()
+}
+
+func BenchmarkPutUint16(b *testing.B) {
+	b.SetBytes(2)
+	for i := 0; i < b.N; i++ {
+		BigEndian.PutUint16(putbuf[:2], uint16(i))
+	}
+}
+
+func BenchmarkAppendUint16(b *testing.B) {
+	b.SetBytes(2)
+	for i := 0; i < b.N; i++ {
+		putbuf = BigEndian.AppendUint16(putbuf[:0], uint16(i))
+	}
+}
+
+func BenchmarkPutUint32(b *testing.B) {
+	b.SetBytes(4)
+	for i := 0; i < b.N; i++ {
+		BigEndian.PutUint32(putbuf[:4], uint32(i))
+	}
+}
+
+func BenchmarkAppendUint32(b *testing.B) {
+	b.SetBytes(4)
+	for i := 0; i < b.N; i++ {
+		putbuf = BigEndian.AppendUint32(putbuf[:0], uint32(i))
+	}
+}
+
+func BenchmarkPutUint64(b *testing.B) {
+	b.SetBytes(8)
+	for i := 0; i < b.N; i++ {
+		BigEndian.PutUint64(putbuf[:8], uint64(i))
+	}
+}
+
+func BenchmarkAppendUint64(b *testing.B) {
+	b.SetBytes(8)
+	for i := 0; i < b.N; i++ {
+		putbuf = BigEndian.AppendUint64(putbuf[:0], uint64(i))
+	}
+}
+
+func BenchmarkLittleEndianPutUint16(b *testing.B) {
+	b.SetBytes(2)
+	for i := 0; i < b.N; i++ {
+		LittleEndian.PutUint16(putbuf[:2], uint16(i))
+	}
+}
+
+func BenchmarkLittleEndianAppendUint16(b *testing.B) {
+	b.SetBytes(2)
+	for i := 0; i < b.N; i++ {
+		putbuf = LittleEndian.AppendUint16(putbuf[:0], uint16(i))
+	}
+}
+
+func BenchmarkLittleEndianPutUint32(b *testing.B) {
+	b.SetBytes(4)
+	for i := 0; i < b.N; i++ {
+		LittleEndian.PutUint32(putbuf[:4], uint32(i))
+	}
+}
+
+func BenchmarkLittleEndianAppendUint32(b *testing.B) {
+	b.SetBytes(4)
+	for i := 0; i < b.N; i++ {
+		putbuf = LittleEndian.AppendUint32(putbuf[:0], uint32(i))
+	}
+}
+
+func BenchmarkLittleEndianPutUint64(b *testing.B) {
+	b.SetBytes(8)
+	for i := 0; i < b.N; i++ {
+		LittleEndian.PutUint64(putbuf[:8], uint64(i))
+	}
+}
+
+func BenchmarkLittleEndianAppendUint64(b *testing.B) {
+	b.SetBytes(8)
+	for i := 0; i < b.N; i++ {
+		putbuf = LittleEndian.AppendUint64(putbuf[:0], uint64(i))
+	}
+}
+
+func BenchmarkReadFloats(b *testing.B) {
+	var ls Struct
+	bsr := &byteSliceReader{}
+	var r io.Reader = bsr
+	b.SetBytes(4 + 8)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bsr.remain = big[30:]
+		Read(r, BigEndian, &ls.Float32)
+		Read(r, BigEndian, &ls.Float64)
+	}
+	b.StopTimer()
+	want := s
+	want.Int8 = 0
+	want.Int16 = 0
+	want.Int32 = 0
+	want.Int64 = 0
+	want.Uint8 = 0
+	want.Uint16 = 0
+	want.Uint32 = 0
+	want.Uint64 = 0
+	want.Complex64 = 0
+	want.Complex128 = 0
+	want.Array = [4]uint8{0, 0, 0, 0}
+	want.Bool = false
+	want.BoolArray = [4]bool{false, false, false, false}
+	if b.N > 0 && !reflect.DeepEqual(ls, want) {
+		b.Fatalf("struct doesn't match:\ngot  %v;\nwant %v", ls, want)
+	}
+}
+
+func BenchmarkWriteFloats(b *testing.B) {
+	buf := new(bytes.Buffer)
+	var w io.Writer = buf
+	b.SetBytes(4 + 8)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		Write(w, BigEndian, s.Float32)
+		Write(w, BigEndian, s.Float64)
+	}
+	b.StopTimer()
+	if b.N > 0 && !bytes.Equal(buf.Bytes(), big[30:30+4+8]) {
+		b.Fatalf("first half doesn't match: %x %x", buf.Bytes(), big[30:30+4+8])
+	}
+}
+
+func BenchmarkReadSlice1000Float32s(b *testing.B) {
+	bsr := &byteSliceReader{}
+	slice := make([]float32, 1000)
+	buf := make([]byte, len(slice)*4)
+	b.SetBytes(int64(len(buf)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bsr.remain = buf
+		Read(bsr, BigEndian, slice)
+	}
+}
+
+func BenchmarkWriteSlice1000Float32s(b *testing.B) {
+	slice := make([]float32, 1000)
+	buf := new(bytes.Buffer)
+	var w io.Writer = buf
+	b.SetBytes(4 * 1000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		Write(w, BigEndian, slice)
+	}
+	b.StopTimer()
+}
+
+func BenchmarkReadSlice1000Uint8s(b *testing.B) {
+	bsr := &byteSliceReader{}
+	slice := make([]uint8, 1000)
+	buf := make([]byte, len(slice))
+	b.SetBytes(int64(len(buf)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bsr.remain = buf
+		Read(bsr, BigEndian, slice)
+	}
+}
+
+func BenchmarkWriteSlice1000Uint8s(b *testing.B) {
+	slice := make([]uint8, 1000)
+	buf := new(bytes.Buffer)
+	var w io.Writer = buf
+	b.SetBytes(1000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		Write(w, BigEndian, slice)
+	}
+}
+
+func TestNativeEndian(t *testing.T) {
+	const val = 0x12345678
+	i := uint32(val)
+	s := unsafe.Slice((*byte)(unsafe.Pointer(&i)), unsafe.Sizeof(i))
+	if v := NativeEndian.Uint32(s); v != val {
+		t.Errorf("NativeEndian.Uint32 returned %#x, expected %#x", v, val)
+	}
 }

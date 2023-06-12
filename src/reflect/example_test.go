@@ -5,11 +5,31 @@
 package reflect_test
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
 )
+
+func ExampleKind() {
+	for _, v := range []any{"hi", 42, func() {}} {
+		switch v := reflect.ValueOf(v); v.Kind() {
+		case reflect.String:
+			fmt.Println(v.String())
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			fmt.Println(v.Int())
+		default:
+			fmt.Printf("unhandled kind %s", v.Kind())
+		}
+	}
+
+	// Output:
+	// hi
+	// 42
+	// unhandled kind func
+}
 
 func ExampleMakeFunc() {
 	// swap is the implementation passed to MakeFunc.
@@ -25,7 +45,7 @@ func ExampleMakeFunc() {
 	// When the function is invoked, reflect turns the arguments
 	// into Values, calls swap, and then turns swap's result slice
 	// into the values returned by the new function.
-	makeSwap := func(fptr interface{}) {
+	makeSwap := func(fptr any) {
 		// fptr is a pointer to a function.
 		// Obtain the function value itself (likely nil) as a reflect.Value
 		// so that we can query its type and then set the value.
@@ -106,4 +126,84 @@ func ExampleTypeOf() {
 
 	// Output:
 	// true
+}
+
+func ExampleStructOf() {
+	typ := reflect.StructOf([]reflect.StructField{
+		{
+			Name: "Height",
+			Type: reflect.TypeOf(float64(0)),
+			Tag:  `json:"height"`,
+		},
+		{
+			Name: "Age",
+			Type: reflect.TypeOf(int(0)),
+			Tag:  `json:"age"`,
+		},
+	})
+
+	v := reflect.New(typ).Elem()
+	v.Field(0).SetFloat(0.4)
+	v.Field(1).SetInt(2)
+	s := v.Addr().Interface()
+
+	w := new(bytes.Buffer)
+	if err := json.NewEncoder(w).Encode(s); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("value: %+v\n", s)
+	fmt.Printf("json:  %s", w.Bytes())
+
+	r := bytes.NewReader([]byte(`{"height":1.5,"age":10}`))
+	if err := json.NewDecoder(r).Decode(s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("value: %+v\n", s)
+
+	// Output:
+	// value: &{Height:0.4 Age:2}
+	// json:  {"height":0.4,"age":2}
+	// value: &{Height:1.5 Age:10}
+}
+
+func ExampleValue_FieldByIndex() {
+	// This example shows a case in which the name of a promoted field
+	// is hidden by another field: FieldByName will not work, so
+	// FieldByIndex must be used instead.
+	type user struct {
+		firstName string
+		lastName  string
+	}
+
+	type data struct {
+		user
+		firstName string
+		lastName  string
+	}
+
+	u := data{
+		user:      user{"Embedded John", "Embedded Doe"},
+		firstName: "John",
+		lastName:  "Doe",
+	}
+
+	s := reflect.ValueOf(u).FieldByIndex([]int{0, 1})
+	fmt.Println("embedded last name:", s)
+
+	// Output:
+	// embedded last name: Embedded Doe
+}
+
+func ExampleValue_FieldByName() {
+	type user struct {
+		firstName string
+		lastName  string
+	}
+	u := user{firstName: "John", lastName: "Doe"}
+	s := reflect.ValueOf(u)
+
+	fmt.Println("Name:", s.FieldByName("firstName"))
+	// Output:
+	// Name: John
 }

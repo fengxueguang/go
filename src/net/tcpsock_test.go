@@ -2,11 +2,15 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !js && !wasip1
+
 package net
 
 import (
+	"fmt"
 	"internal/testenv"
 	"io"
+	"os"
 	"reflect"
 	"runtime"
 	"sync"
@@ -31,28 +35,28 @@ func BenchmarkTCP4PersistentTimeout(b *testing.B) {
 }
 
 func BenchmarkTCP6OneShot(b *testing.B) {
-	if !supportsIPv6 {
+	if !supportsIPv6() {
 		b.Skip("ipv6 is not supported")
 	}
 	benchmarkTCP(b, false, false, "[::1]:0")
 }
 
 func BenchmarkTCP6OneShotTimeout(b *testing.B) {
-	if !supportsIPv6 {
+	if !supportsIPv6() {
 		b.Skip("ipv6 is not supported")
 	}
 	benchmarkTCP(b, false, true, "[::1]:0")
 }
 
 func BenchmarkTCP6Persistent(b *testing.B) {
-	if !supportsIPv6 {
+	if !supportsIPv6() {
 		b.Skip("ipv6 is not supported")
 	}
 	benchmarkTCP(b, true, false, "[::1]:0")
 }
 
 func BenchmarkTCP6PersistentTimeout(b *testing.B) {
-	if !supportsIPv6 {
+	if !supportsIPv6() {
 		b.Skip("ipv6 is not supported")
 	}
 	benchmarkTCP(b, true, true, "[::1]:0")
@@ -162,7 +166,7 @@ func BenchmarkTCP4ConcurrentReadWrite(b *testing.B) {
 }
 
 func BenchmarkTCP6ConcurrentReadWrite(b *testing.B) {
-	if !supportsIPv6 {
+	if !supportsIPv6() {
 		b.Skip("ipv6 is not supported")
 	}
 	benchmarkTCPConcurrentReadWrite(b, "[::1]:0")
@@ -310,6 +314,17 @@ var resolveTCPAddrTests = []resolveTCPAddrTest{
 	{"tcp", ":12345", &TCPAddr{Port: 12345}, nil},
 
 	{"http", "127.0.0.1:0", nil, UnknownNetworkError("http")},
+
+	{"tcp", "127.0.0.1:http", &TCPAddr{IP: ParseIP("127.0.0.1"), Port: 80}, nil},
+	{"tcp", "[::ffff:127.0.0.1]:http", &TCPAddr{IP: ParseIP("::ffff:127.0.0.1"), Port: 80}, nil},
+	{"tcp", "[2001:db8::1]:http", &TCPAddr{IP: ParseIP("2001:db8::1"), Port: 80}, nil},
+	{"tcp4", "127.0.0.1:http", &TCPAddr{IP: ParseIP("127.0.0.1"), Port: 80}, nil},
+	{"tcp4", "[::ffff:127.0.0.1]:http", &TCPAddr{IP: ParseIP("127.0.0.1"), Port: 80}, nil},
+	{"tcp6", "[2001:db8::1]:http", &TCPAddr{IP: ParseIP("2001:db8::1"), Port: 80}, nil},
+
+	{"tcp4", "[2001:db8::1]:http", nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: "2001:db8::1"}},
+	{"tcp6", "127.0.0.1:http", nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: "127.0.0.1"}},
+	{"tcp6", "[::ffff:127.0.0.1]:http", nil, &AddrError{Err: errNoSuitableAddress.Error(), Addr: "::ffff:127.0.0.1"}},
 }
 
 func TestResolveTCPAddr(t *testing.T) {
@@ -317,21 +332,17 @@ func TestResolveTCPAddr(t *testing.T) {
 	defer func() { testHookLookupIP = origTestHookLookupIP }()
 	testHookLookupIP = lookupLocalhost
 
-	for i, tt := range resolveTCPAddrTests {
+	for _, tt := range resolveTCPAddrTests {
 		addr, err := ResolveTCPAddr(tt.network, tt.litAddrOrName)
-		if err != tt.err {
-			t.Errorf("#%d: %v", i, err)
-		} else if !reflect.DeepEqual(addr, tt.addr) {
-			t.Errorf("#%d: got %#v; want %#v", i, addr, tt.addr)
-		}
-		if err != nil {
+		if !reflect.DeepEqual(addr, tt.addr) || !reflect.DeepEqual(err, tt.err) {
+			t.Errorf("ResolveTCPAddr(%q, %q) = %#v, %v, want %#v, %v", tt.network, tt.litAddrOrName, addr, err, tt.addr, tt.err)
 			continue
 		}
-		rtaddr, err := ResolveTCPAddr(addr.Network(), addr.String())
-		if err != nil {
-			t.Errorf("#%d: %v", i, err)
-		} else if !reflect.DeepEqual(rtaddr, addr) {
-			t.Errorf("#%d: got %#v; want %#v", i, rtaddr, addr)
+		if err == nil {
+			addr2, err := ResolveTCPAddr(addr.Network(), addr.String())
+			if !reflect.DeepEqual(addr2, tt.addr) || err != tt.err {
+				t.Errorf("(%q, %q): ResolveTCPAddr(%q, %q) = %#v, %v, want %#v, %v", tt.network, tt.litAddrOrName, addr.Network(), addr.String(), addr2, err, tt.addr, tt.err)
+			}
 		}
 	}
 }
@@ -364,7 +375,7 @@ func TestTCPListenerName(t *testing.T) {
 func TestIPv6LinkLocalUnicastTCP(t *testing.T) {
 	testenv.MustHaveExternalNetwork(t)
 
-	if !supportsIPv6 {
+	if !supportsIPv6() {
 		t.Skip("IPv6 is not supported")
 	}
 
@@ -376,13 +387,10 @@ func TestIPv6LinkLocalUnicastTCP(t *testing.T) {
 			t.Log(err)
 			continue
 		}
-		ls, err := (&streamListener{Listener: ln}).newLocalServer()
-		if err != nil {
-			t.Fatal(err)
-		}
+		ls := (&streamListener{Listener: ln}).newLocalServer()
 		defer ls.teardown()
 		ch := make(chan error, 1)
-		handler := func(ls *localServer, ln Listener) { transponder(ln, ch) }
+		handler := func(ls *localServer, ln Listener) { ls.transponder(ln, ch) }
 		if err := ls.buildup(handler); err != nil {
 			t.Fatal(err)
 		}
@@ -460,11 +468,10 @@ func TestTCPConcurrentAccept(t *testing.T) {
 
 func TestTCPReadWriteAllocs(t *testing.T) {
 	switch runtime.GOOS {
-	case "nacl", "windows":
-		// NaCl needs to allocate pseudo file descriptor
-		// stuff. See syscall/fd_nacl.go.
-		// Windows uses closures and channels for IO
-		// completion port-based netpoll. See fd_windows.go.
+	case "plan9":
+		// The implementation of asynchronous cancelable
+		// I/O on Plan 9 allocates memory.
+		// See net/fd_io_plan9.go.
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 
@@ -474,7 +481,7 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 	}
 	defer ln.Close()
 	var server Conn
-	errc := make(chan error)
+	errc := make(chan error, 1)
 	go func() {
 		var err error
 		server, err = ln.Accept()
@@ -489,6 +496,7 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
+
 	var buf [128]byte
 	allocs := testing.AllocsPerRun(1000, func() {
 		_, err := server.Write(buf[:])
@@ -497,6 +505,28 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		}
 		_, err = io.ReadFull(client, buf[:])
 		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 0 {
+		t.Fatalf("got %v; want 0", allocs)
+	}
+
+	var bufwrt [128]byte
+	ch := make(chan bool)
+	defer close(ch)
+	go func() {
+		for <-ch {
+			_, err := server.Write(bufwrt[:])
+			errc <- err
+		}
+	}()
+	allocs = testing.AllocsPerRun(1000, func() {
+		ch <- true
+		if _, err = io.ReadFull(client, buf[:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-errc; err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -587,49 +617,169 @@ func TestTCPStress(t *testing.T) {
 	<-done
 }
 
-func TestTCPSelfConnect(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		// TODO(brainman): do not know why it hangs.
-		t.Skip("known-broken test on windows")
+// Test that >32-bit reads work on 64-bit systems.
+// On 32-bit systems this tests that maxint reads work.
+func TestTCPBig(t *testing.T) {
+	if !*testTCPBig {
+		t.Skip("test disabled; use -tcpbig to enable")
 	}
 
-	ln, err := newLocalListener("tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var d Dialer
-	c, err := d.Dial(ln.Addr().Network(), ln.Addr().String())
-	if err != nil {
-		ln.Close()
-		t.Fatal(err)
-	}
-	network := c.LocalAddr().Network()
-	laddr := *c.LocalAddr().(*TCPAddr)
-	c.Close()
-	ln.Close()
+	for _, writev := range []bool{false, true} {
+		t.Run(fmt.Sprintf("writev=%v", writev), func(t *testing.T) {
+			ln := newLocalListener(t, "tcp")
+			defer ln.Close()
 
-	// Try to connect to that address repeatedly.
-	n := 100000
-	if testing.Short() {
-		n = 1000
-	}
-	switch runtime.GOOS {
-	case "darwin", "dragonfly", "freebsd", "netbsd", "openbsd", "plan9", "solaris", "windows":
-		// Non-Linux systems take a long time to figure
-		// out that there is nothing listening on localhost.
-		n = 100
-	}
-	for i := 0; i < n; i++ {
-		d.Timeout = time.Millisecond
-		c, err := d.Dial(network, laddr.String())
-		if err == nil {
-			addr := c.LocalAddr().(*TCPAddr)
-			if addr.Port == laddr.Port || addr.IP.Equal(laddr.IP) {
-				t.Errorf("Dial %v should fail", addr)
-			} else {
-				t.Logf("Dial %v succeeded - possibly racing with other listener", addr)
+			x := int(1 << 30)
+			x = x*5 + 1<<20 // just over 5 GB on 64-bit, just over 1GB on 32-bit
+			done := make(chan int)
+			go func() {
+				defer close(done)
+				c, err := ln.Accept()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				buf := make([]byte, x)
+				var n int
+				if writev {
+					var n64 int64
+					n64, err = (&Buffers{buf}).WriteTo(c)
+					n = int(n64)
+				} else {
+					n, err = c.Write(buf)
+				}
+				if n != len(buf) || err != nil {
+					t.Errorf("Write(buf) = %d, %v, want %d, nil", n, err, x)
+				}
+				c.Close()
+			}()
+
+			c, err := Dial("tcp", ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, x)
+			n, err := io.ReadFull(c, buf)
+			if n != len(buf) || err != nil {
+				t.Errorf("Read(buf) = %d, %v, want %d, nil", n, err, x)
 			}
 			c.Close()
+			<-done
+		})
+	}
+}
+
+func TestCopyPipeIntoTCP(t *testing.T) {
+	ln := newLocalListener(t, "tcp")
+	defer ln.Close()
+
+	errc := make(chan error, 1)
+	defer func() {
+		if err := <-errc; err != nil {
+			t.Error(err)
 		}
+	}()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			errc <- err
+			return
+		}
+		defer c.Close()
+
+		buf := make([]byte, 100)
+		n, err := io.ReadFull(c, buf)
+		if err != io.ErrUnexpectedEOF || n != 2 {
+			errc <- fmt.Errorf("got err=%q n=%v; want err=%q n=2", err, n, io.ErrUnexpectedEOF)
+			return
+		}
+
+		errc <- nil
+	}()
+
+	c, err := Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	errc2 := make(chan error, 1)
+	defer func() {
+		if err := <-errc2; err != nil {
+			t.Error(err)
+		}
+	}()
+
+	defer w.Close()
+
+	go func() {
+		_, err := io.Copy(c, r)
+		errc2 <- err
+	}()
+
+	// Split write into 2 packets. That makes Windows TransmitFile
+	// drop second packet.
+	packet := make([]byte, 1)
+	_, err = w.Write(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	_, err = w.Write(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkSetReadDeadline(b *testing.B) {
+	ln := newLocalListener(b, "tcp")
+	defer ln.Close()
+	var serv Conn
+	done := make(chan error)
+	go func() {
+		var err error
+		serv, err = ln.Accept()
+		done <- err
+	}()
+	c, err := Dial("tcp", ln.Addr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+	if err := <-done; err != nil {
+		b.Fatal(err)
+	}
+	defer serv.Close()
+	c.SetWriteDeadline(time.Now().Add(2 * time.Hour))
+	deadline := time.Now().Add(time.Hour)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.SetReadDeadline(deadline)
+		deadline = deadline.Add(1)
+	}
+}
+
+func TestDialTCPDefaultKeepAlive(t *testing.T) {
+	ln := newLocalListener(t, "tcp")
+	defer ln.Close()
+
+	got := time.Duration(-1)
+	testHookSetKeepAlive = func(d time.Duration) { got = d }
+	defer func() { testHookSetKeepAlive = func(time.Duration) {} }()
+
+	c, err := DialTCP("tcp", nil, ln.Addr().(*TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if got != defaultTCPKeepAlive {
+		t.Errorf("got keepalive %v; want %v", got, defaultTCPKeepAlive)
 	}
 }

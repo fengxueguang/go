@@ -17,47 +17,33 @@ func (s simplifier) Visit(node ast.Node) ast.Visitor {
 	case *ast.CompositeLit:
 		// array, slice, and map composite literals may be simplified
 		outer := n
-		var eltType ast.Expr
+		var keyType, eltType ast.Expr
 		switch typ := outer.Type.(type) {
 		case *ast.ArrayType:
 			eltType = typ.Elt
 		case *ast.MapType:
+			keyType = typ.Key
 			eltType = typ.Value
 		}
 
 		if eltType != nil {
+			var ktyp reflect.Value
+			if keyType != nil {
+				ktyp = reflect.ValueOf(keyType)
+			}
 			typ := reflect.ValueOf(eltType)
 			for i, x := range outer.Elts {
 				px := &outer.Elts[i]
 				// look at value of indexed/named elements
 				if t, ok := x.(*ast.KeyValueExpr); ok {
+					if keyType != nil {
+						s.simplifyLiteral(ktyp, keyType, t.Key, &t.Key)
+					}
 					x = t.Value
 					px = &t.Value
 				}
-				ast.Walk(s, x) // simplify x
-				// if the element is a composite literal and its literal type
-				// matches the outer literal's element type exactly, the inner
-				// literal type may be omitted
-				if inner, ok := x.(*ast.CompositeLit); ok {
-					if match(nil, typ, reflect.ValueOf(inner.Type)) {
-						inner.Type = nil
-					}
-				}
-				// if the outer literal's element type is a pointer type *T
-				// and the element is & of a composite literal of type T,
-				// the inner &T may be omitted.
-				if ptr, ok := eltType.(*ast.StarExpr); ok {
-					if addr, ok := x.(*ast.UnaryExpr); ok && addr.Op == token.AND {
-						if inner, ok := addr.X.(*ast.CompositeLit); ok {
-							if match(nil, reflect.ValueOf(ptr.X), reflect.ValueOf(inner.Type)) {
-								inner.Type = nil // drop T
-								*px = inner      // drop &
-							}
-						}
-					}
-				}
+				s.simplifyLiteral(typ, eltType, x, px)
 			}
-
 			// node was simplified - stop walk (there are no subnodes to simplify)
 			return nil
 		}
@@ -67,22 +53,26 @@ func (s simplifier) Visit(node ast.Node) ast.Visitor {
 		// can be simplified to: s[a:]
 		// if s is "simple enough" (for now we only accept identifiers)
 		//
-		// Note: This may not be correct because len may have been redeclared in another
-		//       file belonging to the same package. However, this is extremely unlikely
-		//       and so far (April 2016, after years of supporting this rewrite feature)
+		// Note: This may not be correct because len may have been redeclared in
+		//       the same package. However, this is extremely unlikely and so far
+		//       (April 2022, after years of supporting this rewrite feature)
 		//       has never come up, so let's keep it working as is (see also #15153).
+		//
+		// Also note that this code used to use go/ast's object tracking,
+		// which was removed in exchange for go/parser.Mode.SkipObjectResolution.
+		// False positives are extremely unlikely as described above,
+		// and go/ast's object tracking is incomplete in any case.
 		if n.Max != nil {
 			// - 3-index slices always require the 2nd and 3rd index
 			break
 		}
-		if s, _ := n.X.(*ast.Ident); s != nil && s.Obj != nil {
-			// the array/slice object is a single, resolved identifier
+		if s, _ := n.X.(*ast.Ident); s != nil {
+			// the array/slice object is a single identifier
 			if call, _ := n.High.(*ast.CallExpr); call != nil && len(call.Args) == 1 && !call.Ellipsis.IsValid() {
 				// the high expression is a function call with a single argument
-				if fun, _ := call.Fun.(*ast.Ident); fun != nil && fun.Name == "len" && fun.Obj == nil {
-					// the function called is "len" and it is not locally defined; and
-					// because we don't have dot imports, it must be the predefined len()
-					if arg, _ := call.Args[0].(*ast.Ident); arg != nil && arg.Obj == s.Obj {
+				if fun, _ := call.Fun.(*ast.Ident); fun != nil && fun.Name == "len" {
+					// the function called is "len"
+					if arg, _ := call.Args[0].(*ast.Ident); arg != nil && arg.Name == s.Name {
 						// the len argument is the array/slice object
 						n.High = nil
 					}
@@ -111,6 +101,32 @@ func (s simplifier) Visit(node ast.Node) ast.Visitor {
 	}
 
 	return s
+}
+
+func (s simplifier) simplifyLiteral(typ reflect.Value, astType, x ast.Expr, px *ast.Expr) {
+	ast.Walk(s, x) // simplify x
+
+	// if the element is a composite literal and its literal type
+	// matches the outer literal's element type exactly, the inner
+	// literal type may be omitted
+	if inner, ok := x.(*ast.CompositeLit); ok {
+		if match(nil, typ, reflect.ValueOf(inner.Type)) {
+			inner.Type = nil
+		}
+	}
+	// if the outer literal's element type is a pointer type *T
+	// and the element is & of a composite literal of type T,
+	// the inner &T may be omitted.
+	if ptr, ok := astType.(*ast.StarExpr); ok {
+		if addr, ok := x.(*ast.UnaryExpr); ok && addr.Op == token.AND {
+			if inner, ok := addr.X.(*ast.CompositeLit); ok {
+				if match(nil, reflect.ValueOf(ptr.X), reflect.ValueOf(inner.Type)) {
+					inner.Type = nil // drop T
+					*px = inner      // drop &
+				}
+			}
+		}
+	}
 }
 
 func isBlank(x ast.Expr) bool {

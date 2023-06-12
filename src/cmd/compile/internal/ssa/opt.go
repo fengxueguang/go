@@ -4,11 +4,7 @@
 
 package ssa
 
-// machine-independent optimization
+// machine-independent optimization.
 func opt(f *Func) {
-	applyRewrite(f, rewriteBlockgeneric, rewriteValuegeneric)
-}
-
-func dec(f *Func) {
-	applyRewrite(f, rewriteBlockdec, rewriteValuedec)
+	applyRewrite(f, rewriteBlockgeneric, rewriteValuegeneric, removeDeadValues)
 }

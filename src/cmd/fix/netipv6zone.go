@@ -11,10 +11,10 @@ func init() {
 }
 
 var netipv6zoneFix = fix{
-	"netipv6zone",
-	"2012-11-26",
-	netipv6zone,
-	`Adapt element key to IPAddr, UDPAddr or TCPAddr composite literals.
+	name: "netipv6zone",
+	date: "2012-11-26",
+	f:    netipv6zone,
+	desc: `Adapt element key to IPAddr, UDPAddr or TCPAddr composite literals.
 
 https://codereview.appspot.com/6849045/
 `,
@@ -26,7 +26,7 @@ func netipv6zone(f *ast.File) bool {
 	}
 
 	fixed := false
-	walk(f, func(n interface{}) {
+	walk(f, func(n any) {
 		cl, ok := n.(*ast.CompositeLit)
 		if !ok {
 			return

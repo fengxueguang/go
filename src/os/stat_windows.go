@@ -5,6 +5,7 @@
 package os
 
 import (
+	"internal/syscall/windows"
 	"syscall"
 	"unsafe"
 )
@@ -15,167 +16,121 @@ func (file *File) Stat() (FileInfo, error) {
 	if file == nil {
 		return nil, ErrInvalid
 	}
-	if file == nil || file.fd < 0 {
-		return nil, syscall.EINVAL
-	}
-	if file.isdir() {
-		// I don't know any better way to do that for directory
-		return Stat(file.dirinfo.path)
-	}
-	if file.name == DevNull {
-		return &devNullStat, nil
-	}
-
-	ft, err := syscall.GetFileType(file.fd)
-	if err != nil {
-		return nil, &PathError{"GetFileType", file.name, err}
-	}
-	if ft == syscall.FILE_TYPE_PIPE {
-		return &fileStat{name: basename(file.name), pipe: true}, nil
-	}
-
-	var d syscall.ByHandleFileInformation
-	err = syscall.GetFileInformationByHandle(file.fd, &d)
-	if err != nil {
-		return nil, &PathError{"GetFileInformationByHandle", file.name, err}
-	}
-	return &fileStat{
-		name: basename(file.name),
-		sys: syscall.Win32FileAttributeData{
-			FileAttributes: d.FileAttributes,
-			CreationTime:   d.CreationTime,
-			LastAccessTime: d.LastAccessTime,
-			LastWriteTime:  d.LastWriteTime,
-			FileSizeHigh:   d.FileSizeHigh,
-			FileSizeLow:    d.FileSizeLow,
-		},
-		vol:   d.VolumeSerialNumber,
-		idxhi: d.FileIndexHigh,
-		idxlo: d.FileIndexLow,
-		pipe:  false,
-	}, nil
+	return statHandle(file.name, file.pfd.Sysfd)
 }
 
-// Stat returns a FileInfo structure describing the named file.
-// If there is an error, it will be of type *PathError.
-func Stat(name string) (FileInfo, error) {
-	var fi FileInfo
-	var err error
-	for {
-		fi, err = Lstat(name)
-		if err != nil {
-			return fi, err
-		}
-		if fi.Mode()&ModeSymlink == 0 {
-			return fi, nil
-		}
-		name, err = Readlink(name)
-		if err != nil {
-			return fi, err
-		}
-	}
-}
-
-// Lstat returns the FileInfo structure describing the named file.
-// If the file is a symbolic link, the returned FileInfo
-// describes the symbolic link. Lstat makes no attempt to follow the link.
-// If there is an error, it will be of type *PathError.
-func Lstat(name string) (FileInfo, error) {
+// stat implements both Stat and Lstat of a file.
+func stat(funcname, name string, followSymlinks bool) (FileInfo, error) {
 	if len(name) == 0 {
-		return nil, &PathError{"Lstat", name, syscall.Errno(syscall.ERROR_PATH_NOT_FOUND)}
+		return nil, &PathError{Op: funcname, Path: name, Err: syscall.Errno(syscall.ERROR_PATH_NOT_FOUND)}
 	}
-	if name == DevNull {
-		return &devNullStat, nil
+	namep, err := syscall.UTF16PtrFromString(fixLongPath(name))
+	if err != nil {
+		return nil, &PathError{Op: funcname, Path: name, Err: err}
 	}
-	fs := &fileStat{name: basename(name)}
-	namep, e := syscall.UTF16PtrFromString(name)
-	if e != nil {
-		return nil, &PathError{"Lstat", name, e}
-	}
-	e = syscall.GetFileAttributesEx(namep, syscall.GetFileExInfoStandard, (*byte)(unsafe.Pointer(&fs.sys)))
-	if e != nil {
-		return nil, &PathError{"GetFileAttributesEx", name, e}
-	}
-	fs.path = name
-	if !isAbs(fs.path) {
-		fs.path, e = syscall.FullPath(fs.path)
-		if e != nil {
-			return nil, e
+
+	// Try GetFileAttributesEx first, because it is faster than CreateFile.
+	// See https://golang.org/issues/19922#issuecomment-300031421 for details.
+	var fa syscall.Win32FileAttributeData
+	err = syscall.GetFileAttributesEx(namep, syscall.GetFileExInfoStandard, (*byte)(unsafe.Pointer(&fa)))
+
+	// GetFileAttributesEx fails with ERROR_SHARING_VIOLATION error for
+	// files like c:\pagefile.sys. Use FindFirstFile for such files.
+	if err == windows.ERROR_SHARING_VIOLATION {
+		var fd syscall.Win32finddata
+		sh, err := syscall.FindFirstFile(namep, &fd)
+		if err != nil {
+			return nil, &PathError{Op: "FindFirstFile", Path: name, Err: err}
 		}
-	}
-	return fs, nil
-}
-
-// basename removes trailing slashes and the leading
-// directory name and drive letter from path name.
-func basename(name string) string {
-	// Remove drive letter
-	if len(name) == 2 && name[1] == ':' {
-		name = "."
-	} else if len(name) > 2 && name[1] == ':' {
-		name = name[2:]
-	}
-	i := len(name) - 1
-	// Remove trailing slashes
-	for ; i > 0 && (name[i] == '/' || name[i] == '\\'); i-- {
-		name = name[:i]
-	}
-	// Remove leading directory name
-	for i--; i >= 0; i-- {
-		if name[i] == '/' || name[i] == '\\' {
-			name = name[i+1:]
-			break
-		}
-	}
-	return name
-}
-
-func isAbs(path string) (b bool) {
-	v := volumeName(path)
-	if v == "" {
-		return false
-	}
-	path = path[len(v):]
-	if path == "" {
-		return false
-	}
-	return IsPathSeparator(path[0])
-}
-
-func volumeName(path string) (v string) {
-	if len(path) < 2 {
-		return ""
-	}
-	// with drive letter
-	c := path[0]
-	if path[1] == ':' &&
-		('0' <= c && c <= '9' || 'a' <= c && c <= 'z' ||
-			'A' <= c && c <= 'Z') {
-		return path[:2]
-	}
-	// is it UNC
-	if l := len(path); l >= 5 && IsPathSeparator(path[0]) && IsPathSeparator(path[1]) &&
-		!IsPathSeparator(path[2]) && path[2] != '.' {
-		// first, leading `\\` and next shouldn't be `\`. its server name.
-		for n := 3; n < l-1; n++ {
-			// second, next '\' shouldn't be repeated.
-			if IsPathSeparator(path[n]) {
-				n++
-				// third, following something characters. its share name.
-				if !IsPathSeparator(path[n]) {
-					if path[n] == '.' {
-						break
-					}
-					for ; n < l; n++ {
-						if IsPathSeparator(path[n]) {
-							break
-						}
-					}
-					return path[:n]
-				}
-				break
+		syscall.FindClose(sh)
+		if fd.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+			// Not a symlink or mount point. FindFirstFile is good enough.
+			fs := newFileStatFromWin32finddata(&fd)
+			if err := fs.saveInfoFromPath(name); err != nil {
+				return nil, err
 			}
+			return fs, nil
 		}
 	}
-	return ""
+
+	if err == nil && fa.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		// The file is definitely not a symlink, because it isn't any kind of reparse point.
+		// The information we got from GetFileAttributesEx is good enough for now.
+		fs := &fileStat{
+			FileAttributes: fa.FileAttributes,
+			CreationTime:   fa.CreationTime,
+			LastAccessTime: fa.LastAccessTime,
+			LastWriteTime:  fa.LastWriteTime,
+			FileSizeHigh:   fa.FileSizeHigh,
+			FileSizeLow:    fa.FileSizeLow,
+		}
+		if err := fs.saveInfoFromPath(name); err != nil {
+			return nil, err
+		}
+		return fs, nil
+	}
+
+	// Use CreateFile to determine whether the file is a symlink and, if so,
+	// save information about the link target.
+	// Set FILE_FLAG_BACKUP_SEMANTICS so that CreateFile will create the handle
+	// even if name refers to a directory.
+	h, err := syscall.CreateFile(namep, 0, 0, nil, syscall.OPEN_EXISTING, syscall.FILE_FLAG_BACKUP_SEMANTICS|syscall.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		// Since CreateFile failed, we can't determine whether name refers to a
+		// symlink, or some other kind of reparse point. Since we can't return a
+		// FileInfo with a known-accurate Mode, we must return an error.
+		return nil, &PathError{Op: "CreateFile", Path: name, Err: err}
+	}
+
+	fi, err := statHandle(name, h)
+	syscall.CloseHandle(h)
+	if err == nil && followSymlinks && fi.(*fileStat).isSymlink() {
+		// To obtain information about the link target, we reopen the file without
+		// FILE_FLAG_OPEN_REPARSE_POINT and examine the resulting handle.
+		// (See https://devblogs.microsoft.com/oldnewthing/20100212-00/?p=14963.)
+		h, err = syscall.CreateFile(namep, 0, 0, nil, syscall.OPEN_EXISTING, syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
+		if err != nil {
+			// name refers to a symlink, but we couldn't resolve the symlink target.
+			return nil, &PathError{Op: "CreateFile", Path: name, Err: err}
+		}
+		defer syscall.CloseHandle(h)
+		return statHandle(name, h)
+	}
+	return fi, err
+}
+
+func statHandle(name string, h syscall.Handle) (FileInfo, error) {
+	ft, err := syscall.GetFileType(h)
+	if err != nil {
+		return nil, &PathError{Op: "GetFileType", Path: name, Err: err}
+	}
+	switch ft {
+	case syscall.FILE_TYPE_PIPE, syscall.FILE_TYPE_CHAR:
+		return &fileStat{name: basename(name), filetype: ft}, nil
+	}
+	fs, err := newFileStatFromGetFileInformationByHandle(name, h)
+	if err != nil {
+		return nil, err
+	}
+	fs.filetype = ft
+	return fs, err
+}
+
+// statNolog implements Stat for Windows.
+func statNolog(name string) (FileInfo, error) {
+	return stat("Stat", name, true)
+}
+
+// lstatNolog implements Lstat for Windows.
+func lstatNolog(name string) (FileInfo, error) {
+	followSymlinks := false
+	if name != "" && IsPathSeparator(name[len(name)-1]) {
+		// We try to implement POSIX semantics for Lstat path resolution
+		// (per https://pubs.opengroup.org/onlinepubs/9699919799.2013edition/basedefs/V1_chap04.html#tag_04_12):
+		// symlinks before the last separator in the path must be resolved. Since
+		// the last separator in this case follows the last path element, we should
+		// follow symlinks in the last path element.
+		followSymlinks = true
+	}
+	return stat("Lstat", name, followSymlinks)
 }

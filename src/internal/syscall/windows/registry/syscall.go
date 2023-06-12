@@ -2,13 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build windows
+//go:build windows
 
 package registry
 
 import "syscall"
-
-//go:generate go run $GOROOT/src/syscall/mksyscall_windows.go -output zsyscall_windows.go -systemdll syscall.go
 
 const (
 	_REG_OPTION_NON_VOLATILE = 0

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !race
 // +build !race
 
 package race
@@ -38,3 +39,5 @@ func ReadRange(addr unsafe.Pointer, len int) {
 
 func WriteRange(addr unsafe.Pointer, len int) {
 }
+
+func Errors() int { return 0 }

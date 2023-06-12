@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build msan
+//go:build msan
 
 #include "go_asm.h"
 #include "go_tls.h"
@@ -58,16 +58,29 @@ TEXT	runtime·msanfree(SB), NOSPLIT, $0-16
 	MOVQ	$__msan_free_go(SB), AX
 	JMP	msancall<>(SB)
 
+// func runtime·msanmove(dst, src unsafe.Pointer, sz uintptr)
+TEXT	runtime·msanmove(SB), NOSPLIT, $0-24
+	MOVQ	dst+0(FP), RARG0
+	MOVQ	src+8(FP), RARG1
+	MOVQ	size+16(FP), RARG2
+	// void __msan_memmove(void *dst, void *src, uintptr_t sz);
+	MOVQ	$__msan_memmove(SB), AX
+	JMP	msancall<>(SB)
+
 // Switches SP to g0 stack and calls (AX). Arguments already set.
 TEXT	msancall<>(SB), NOSPLIT, $0-0
 	get_tls(R12)
 	MOVQ	g(R12), R14
+	MOVQ	SP, R12		// callee-saved, preserved across the CALL
+	CMPQ	R14, $0
+	JE	call	// no g; still on a system stack
+
 	MOVQ	g_m(R14), R13
 	// Switch to g0 stack.
-	MOVQ	SP, R12		// callee-saved, preserved across the CALL
 	MOVQ	m_g0(R13), R10
 	CMPQ	R10, R14
 	JE	call	// already on g0
+
 	MOVQ	(g_sched+gobuf_sp)(R10), SP
 call:
 	ANDQ	$~15, SP	// alignment for gcc ABI

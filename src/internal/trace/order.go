@@ -52,6 +52,12 @@ const (
 // incorrect (condition observed on some machines).
 func order1007(m map[int][]*Event) (events []*Event, err error) {
 	pending := 0
+	// The ordering of CPU profile sample events in the data stream is based on
+	// when each run of the signal handler was able to acquire the spinlock,
+	// with original timestamps corresponding to when ReadTrace pulled the data
+	// off of the profBuf queue. Re-sort them by the timestamp we captured
+	// inside the signal handler.
+	sort.Stable(eventList(m[ProfileP]))
 	var batches []*eventBatch
 	for _, v := range m {
 		pending += len(v)
@@ -150,7 +156,7 @@ func stateTransition(ev *Event) (g uint64, init, next gState) {
 		g = ev.G
 		init = gState{1, gRunnable}
 		next = gState{2, gWaiting}
-	case EvGoStart:
+	case EvGoStart, EvGoStartLabel:
 		g = ev.G
 		init = gState{ev.Args[1], gRunnable}
 		next = gState{ev.Args[1] + 1, gRunning}
@@ -165,7 +171,8 @@ func stateTransition(ev *Event) (g uint64, init, next gState) {
 		init = gState{noseq, gRunnable}
 		next = gState{seqinc, gRunning}
 	case EvGoBlock, EvGoBlockSend, EvGoBlockRecv, EvGoBlockSelect,
-		EvGoBlockSync, EvGoBlockCond, EvGoBlockNet, EvGoSleep, EvGoSysBlock:
+		EvGoBlockSync, EvGoBlockCond, EvGoBlockNet, EvGoSleep,
+		EvGoSysBlock, EvGoBlockGC:
 		g = ev.G
 		init = gState{noseq, gRunning}
 		next = gState{noseq, gWaiting}

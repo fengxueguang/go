@@ -14,18 +14,18 @@ func init() {
 }
 
 var gotypesFix = fix{
-	"gotypes",
-	"2015-07-16",
-	gotypes,
-	`Change imports of golang.org/x/tools/go/{exact,types} to go/{constant,types}`,
+	name: "gotypes",
+	date: "2015-07-16",
+	f:    gotypes,
+	desc: `Change imports of golang.org/x/tools/go/{exact,types} to go/{constant,types}`,
 }
 
 func gotypes(f *ast.File) bool {
-	truth := fixGoTypes(f)
+	fixed := fixGoTypes(f)
 	if fixGoExact(f) {
-		truth = true
+		fixed = true
 	}
-	return truth
+	return fixed
 }
 
 func fixGoTypes(f *ast.File) bool {
@@ -36,7 +36,7 @@ func fixGoExact(f *ast.File) bool {
 	// This one is harder because the import name changes.
 	// First find the import spec.
 	var importSpec *ast.ImportSpec
-	walk(f, func(n interface{}) {
+	walk(f, func(n any) {
 		if importSpec != nil {
 			return
 		}

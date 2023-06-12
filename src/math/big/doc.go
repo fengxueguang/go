@@ -31,7 +31,7 @@ setters, for instance:
 
 	var z1 Int
 	z1.SetUint64(123)                 // z1 := 123
-	z2 := new(Rat).SetFloat64(1.2)    // z2 := 6/5
+	z2 := new(Rat).SetFloat64(1.25)   // z2 := 5/4
 	z3 := new(Float).SetInt(z1)       // z3 := 123.0
 
 Setters, numeric operations and predicates are represented as methods of
@@ -92,8 +92,7 @@ the Stringer interface for a (default) string representation of the value,
 but also provide SetString methods to initialize a value from a string in
 a variety of supported formats (see the respective SetString documentation).
 
-Finally, *Int, *Rat, and *Float satisfy the fmt package's Scanner interface
-for scanning and (except for *Rat) the Formatter interface for formatted
-printing.
+Finally, *Int, *Rat, and *Float satisfy [fmt.Scanner] for scanning
+and (except for *Rat) the Formatter interface for formatted printing.
 */
 package big

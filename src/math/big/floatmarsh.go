@@ -8,6 +8,7 @@ package big
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -16,7 +17,7 @@ const floatGobVersion byte = 1
 
 // GobEncode implements the gob.GobEncoder interface.
 // The Float value and all its attributes (precision,
-// rounding mode, accuracy) are marshalled.
+// rounding mode, accuracy) are marshaled.
 func (x *Float) GobEncode() ([]byte, error) {
 	if x == nil {
 		return nil, nil
@@ -67,6 +68,9 @@ func (z *Float) GobDecode(buf []byte) error {
 		*z = Float{}
 		return nil
 	}
+	if len(buf) < 6 {
+		return errors.New("Float.GobDecode: buffer too small")
+	}
 
 	if buf[0] != floatGobVersion {
 		return fmt.Errorf("Float.GobDecode: encoding version %d not supported", buf[0])
@@ -83,6 +87,9 @@ func (z *Float) GobDecode(buf []byte) error {
 	z.prec = binary.BigEndian.Uint32(buf[2:])
 
 	if z.form == finite {
+		if len(buf) < 10 {
+			return errors.New("Float.GobDecode: buffer too small for finite form float")
+		}
 		z.exp = int32(binary.BigEndian.Uint32(buf[6:]))
 		z.mant = z.mant.setBytes(buf[10:])
 	}
@@ -90,6 +97,10 @@ func (z *Float) GobDecode(buf []byte) error {
 	if oldPrec != 0 {
 		z.mode = oldMode
 		z.SetPrec(uint(oldPrec))
+	}
+
+	if msg := z.validate0(); msg != "" {
+		return errors.New("Float.GobDecode: " + msg)
 	}
 
 	return nil

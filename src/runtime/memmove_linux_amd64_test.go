@@ -5,9 +5,7 @@
 package runtime_test
 
 import (
-	"io/ioutil"
 	"os"
-	"reflect"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -16,8 +14,9 @@ import (
 // TestMemmoveOverflow maps 3GB of memory and calls memmove on
 // the corresponding slice.
 func TestMemmoveOverflow(t *testing.T) {
+	t.Parallel()
 	// Create a temporary file.
-	tmp, err := ioutil.TempFile("", "go-memmovetest")
+	tmp, err := os.CreateTemp("", "go-memmovetest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,16 +39,12 @@ func TestMemmoveOverflow(t *testing.T) {
 		_, _, errno := syscall.Syscall6(syscall.SYS_MMAP,
 			base+off, 65536, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED|syscall.MAP_FIXED, tmp.Fd(), 0)
 		if errno != 0 {
-			t.Fatalf("could not map a page at requested 0x%x: %s", base+off, errno)
+			t.Skipf("could not map a page at requested 0x%x: %s", base+off, errno)
 		}
 		defer syscall.Syscall(syscall.SYS_MUNMAP, base+off, 65536, 0)
 	}
 
-	var s []byte
-	sp := (*reflect.SliceHeader)(unsafe.Pointer(&s))
-	sp.Data = base
-	sp.Len, sp.Cap = 3<<30, 3<<30
-
+	s := unsafe.Slice((*byte)(unsafe.Pointer(base)), 3<<30)
 	n := copy(s[1:], s)
 	if n != 3<<30-1 {
 		t.Fatalf("copied %d bytes, expected %d", n, 3<<30-1)

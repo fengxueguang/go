@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !nacl,!plan9,!windows
+//go:build !js && !plan9 && !wasip1 && !windows
 
 package net
 
@@ -25,7 +25,7 @@ func TestReadUnixgramWithUnnamedSocket(t *testing.T) {
 		testenv.SkipFlaky(t, 15157)
 	}
 
-	addr := testUnixAddr()
+	addr := testUnixAddr(t)
 	la, err := ResolveUnixAddr("unixgram", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -76,10 +76,7 @@ func TestUnixgramZeroBytePayload(t *testing.T) {
 		t.Skip("unixgram test")
 	}
 
-	c1, err := newLocalPacketListener("unixgram")
-	if err != nil {
-		t.Fatal(err)
-	}
+	c1 := newLocalPacketListener(t, "unixgram")
 	defer os.Remove(c1.LocalAddr().String())
 	defer c1.Close()
 
@@ -112,7 +109,7 @@ func TestUnixgramZeroBytePayload(t *testing.T) {
 				t.Fatalf("unexpected peer address: %v", peer)
 			}
 		default: // Read may timeout, it depends on the platform
-			if nerr, ok := err.(Error); !ok || !nerr.Timeout() {
+			if !isDeadlineExceeded(err) {
 				t.Fatal(err)
 			}
 		}
@@ -126,10 +123,7 @@ func TestUnixgramZeroByteBuffer(t *testing.T) {
 	// issue 4352: Recvfrom failed with "address family not
 	// supported by protocol family" if zero-length buffer provided
 
-	c1, err := newLocalPacketListener("unixgram")
-	if err != nil {
-		t.Fatal(err)
-	}
+	c1 := newLocalPacketListener(t, "unixgram")
 	defer os.Remove(c1.LocalAddr().String())
 	defer c1.Close()
 
@@ -162,56 +156,11 @@ func TestUnixgramZeroByteBuffer(t *testing.T) {
 				t.Fatalf("unexpected peer address: %v", peer)
 			}
 		default: // Read may timeout, it depends on the platform
-			if nerr, ok := err.(Error); !ok || !nerr.Timeout() {
+			if !isDeadlineExceeded(err) {
 				t.Fatal(err)
 			}
 		}
 	}
-}
-
-func TestUnixgramAutobind(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("autobind is linux only")
-	}
-
-	laddr := &UnixAddr{Name: "", Net: "unixgram"}
-	c1, err := ListenUnixgram("unixgram", laddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-
-	// retrieve the autobind address
-	autoAddr := c1.LocalAddr().(*UnixAddr)
-	if len(autoAddr.Name) <= 1 {
-		t.Fatalf("invalid autobind address: %v", autoAddr)
-	}
-	if autoAddr.Name[0] != '@' {
-		t.Fatalf("invalid autobind address: %v", autoAddr)
-	}
-
-	c2, err := DialUnix("unixgram", nil, autoAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-
-	if !reflect.DeepEqual(c1.LocalAddr(), c2.RemoteAddr()) {
-		t.Fatalf("expected autobind address %v, got %v", c1.LocalAddr(), c2.RemoteAddr())
-	}
-}
-
-func TestUnixAutobindClose(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("autobind is linux only")
-	}
-
-	laddr := &UnixAddr{Name: "", Net: "unix"}
-	ln, err := ListenUnix("unix", laddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln.Close()
 }
 
 func TestUnixgramWrite(t *testing.T) {
@@ -219,7 +168,7 @@ func TestUnixgramWrite(t *testing.T) {
 		t.Skip("unixgram test")
 	}
 
-	addr := testUnixAddr()
+	addr := testUnixAddr(t)
 	laddr, err := ResolveUnixAddr("unixgram", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -264,7 +213,7 @@ func testUnixgramWriteConn(t *testing.T, raddr *UnixAddr) {
 }
 
 func testUnixgramWritePacketConn(t *testing.T, raddr *UnixAddr) {
-	addr := testUnixAddr()
+	addr := testUnixAddr(t)
 	c, err := ListenPacket("unixgram", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -293,9 +242,9 @@ func TestUnixConnLocalAndRemoteNames(t *testing.T) {
 	}
 
 	handler := func(ls *localServer, ln Listener) {}
-	for _, laddr := range []string{"", testUnixAddr()} {
+	for _, laddr := range []string{"", testUnixAddr(t)} {
 		laddr := laddr
-		taddr := testUnixAddr()
+		taddr := testUnixAddr(t)
 		ta, err := ResolveUnixAddr("unix", taddr)
 		if err != nil {
 			t.Fatal(err)
@@ -304,10 +253,7 @@ func TestUnixConnLocalAndRemoteNames(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ls, err := (&streamListener{Listener: ln}).newLocalServer()
-		if err != nil {
-			t.Fatal(err)
-		}
+		ls := (&streamListener{Listener: ln}).newLocalServer()
 		defer ls.teardown()
 		if err := ls.buildup(handler); err != nil {
 			t.Fatal(err)
@@ -355,9 +301,9 @@ func TestUnixgramConnLocalAndRemoteNames(t *testing.T) {
 		t.Skip("unixgram test")
 	}
 
-	for _, laddr := range []string{"", testUnixAddr()} {
+	for _, laddr := range []string{"", testUnixAddr(t)} {
 		laddr := laddr
-		taddr := testUnixAddr()
+		taddr := testUnixAddr(t)
 		ta, err := ResolveUnixAddr("unixgram", taddr)
 		if err != nil {
 			t.Fatal(err)
@@ -413,34 +359,105 @@ func TestUnixUnlink(t *testing.T) {
 	if !testableNetwork("unix") {
 		t.Skip("unix test")
 	}
-	name := testUnixAddr()
-	l, err := Listen("unix", name)
-	if err != nil {
-		t.Fatal(err)
+	name := testUnixAddr(t)
+
+	listen := func(t *testing.T) *UnixListener {
+		l, err := Listen("unix", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l.(*UnixListener)
 	}
-	if _, err := os.Stat(name); err != nil {
-		t.Fatalf("cannot stat unix socket after ListenUnix: %v", err)
+	checkExists := func(t *testing.T, desc string) {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("unix socket does not exist %s: %v", desc, err)
+		}
 	}
-	f, _ := l.(*UnixListener).File()
-	l1, err := FileListener(f)
-	if err != nil {
-		t.Fatal(err)
+	checkNotExists := func(t *testing.T, desc string) {
+		if _, err := os.Stat(name); err == nil {
+			t.Fatalf("unix socket does exist %s: %v", desc, err)
+		}
 	}
-	if _, err := os.Stat(name); err != nil {
-		t.Fatalf("cannot stat unix socket after FileListener: %v", err)
-	}
-	if err := l1.Close(); err != nil {
-		t.Fatalf("closing file listener: %v", err)
-	}
-	if _, err := os.Stat(name); err != nil {
-		t.Fatalf("cannot stat unix socket after closing FileListener: %v", err)
-	}
-	f.Close()
-	if _, err := os.Stat(name); err != nil {
-		t.Fatalf("cannot stat unix socket after closing FileListener and fd: %v", err)
-	}
-	l.Close()
-	if _, err := os.Stat(name); err == nil {
-		t.Fatal("closing unix listener did not remove unix socket")
-	}
+
+	// Listener should remove on close.
+	t.Run("Listen", func(t *testing.T) {
+		l := listen(t)
+		checkExists(t, "after Listen")
+		l.Close()
+		checkNotExists(t, "after Listener close")
+	})
+
+	// FileListener should not.
+	t.Run("FileListener", func(t *testing.T) {
+		l := listen(t)
+		f, _ := l.File()
+		l1, _ := FileListener(f)
+		checkExists(t, "after FileListener")
+		f.Close()
+		checkExists(t, "after File close")
+		l1.Close()
+		checkExists(t, "after FileListener close")
+		l.Close()
+		checkNotExists(t, "after Listener close")
+	})
+
+	// Only first call to l.Close should remove.
+	t.Run("SecondClose", func(t *testing.T) {
+		l := listen(t)
+		checkExists(t, "after Listen")
+		l.Close()
+		checkNotExists(t, "after Listener close")
+		if err := os.WriteFile(name, []byte("hello world"), 0666); err != nil {
+			t.Fatalf("cannot recreate socket file: %v", err)
+		}
+		checkExists(t, "after writing temp file")
+		l.Close()
+		checkExists(t, "after second Listener close")
+		os.Remove(name)
+	})
+
+	// SetUnlinkOnClose should do what it says.
+
+	t.Run("Listen/SetUnlinkOnClose(true)", func(t *testing.T) {
+		l := listen(t)
+		checkExists(t, "after Listen")
+		l.SetUnlinkOnClose(true)
+		l.Close()
+		checkNotExists(t, "after Listener close")
+	})
+
+	t.Run("Listen/SetUnlinkOnClose(false)", func(t *testing.T) {
+		l := listen(t)
+		checkExists(t, "after Listen")
+		l.SetUnlinkOnClose(false)
+		l.Close()
+		checkExists(t, "after Listener close")
+		os.Remove(name)
+	})
+
+	t.Run("FileListener/SetUnlinkOnClose(true)", func(t *testing.T) {
+		l := listen(t)
+		f, _ := l.File()
+		l1, _ := FileListener(f)
+		checkExists(t, "after FileListener")
+		l1.(*UnixListener).SetUnlinkOnClose(true)
+		f.Close()
+		checkExists(t, "after File close")
+		l1.Close()
+		checkNotExists(t, "after FileListener close")
+		l.Close()
+	})
+
+	t.Run("FileListener/SetUnlinkOnClose(false)", func(t *testing.T) {
+		l := listen(t)
+		f, _ := l.File()
+		l1, _ := FileListener(f)
+		checkExists(t, "after FileListener")
+		l1.(*UnixListener).SetUnlinkOnClose(false)
+		f.Close()
+		checkExists(t, "after File close")
+		l1.Close()
+		checkExists(t, "after FileListener close")
+		l.Close()
+	})
 }

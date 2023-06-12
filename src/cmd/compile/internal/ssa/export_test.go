@@ -5,84 +5,130 @@
 package ssa
 
 import (
-	"cmd/internal/obj"
 	"testing"
+
+	"cmd/compile/internal/ir"
+	"cmd/compile/internal/typecheck"
+	"cmd/compile/internal/types"
+	"cmd/internal/obj"
+	"cmd/internal/obj/arm64"
+	"cmd/internal/obj/s390x"
+	"cmd/internal/obj/x86"
+	"cmd/internal/src"
 )
 
 var CheckFunc = checkFunc
-var PrintFunc = printFunc
 var Opt = opt
 var Deadcode = deadcode
 var Copyelim = copyelim
 
-func testConfig(t testing.TB) *Config {
-	testCtxt := &obj.Link{}
-	return NewConfig("amd64", DummyFrontend{t}, testCtxt, true)
+var testCtxts = map[string]*obj.Link{
+	"amd64": obj.Linknew(&x86.Linkamd64),
+	"s390x": obj.Linknew(&s390x.Links390x),
+	"arm64": obj.Linknew(&arm64.Linkarm64),
 }
 
-// DummyFrontend is a test-only frontend.
-// It assumes 64 bit integers and pointers.
-type DummyFrontend struct {
-	t testing.TB
-}
+func testConfig(tb testing.TB) *Conf      { return testConfigArch(tb, "amd64") }
+func testConfigS390X(tb testing.TB) *Conf { return testConfigArch(tb, "s390x") }
+func testConfigARM64(tb testing.TB) *Conf { return testConfigArch(tb, "arm64") }
 
-func (DummyFrontend) StringData(s string) interface{} {
-	return nil
-}
-func (DummyFrontend) Auto(t Type) GCNode {
-	return nil
-}
-func (d DummyFrontend) SplitString(s LocalSlot) (LocalSlot, LocalSlot) {
-	return LocalSlot{s.N, d.TypeBytePtr(), s.Off}, LocalSlot{s.N, d.TypeInt(), s.Off + 8}
-}
-func (d DummyFrontend) SplitInterface(s LocalSlot) (LocalSlot, LocalSlot) {
-	return LocalSlot{s.N, d.TypeBytePtr(), s.Off}, LocalSlot{s.N, d.TypeBytePtr(), s.Off + 8}
-}
-func (d DummyFrontend) SplitSlice(s LocalSlot) (LocalSlot, LocalSlot, LocalSlot) {
-	return LocalSlot{s.N, s.Type.ElemType().PtrTo(), s.Off},
-		LocalSlot{s.N, d.TypeInt(), s.Off + 8},
-		LocalSlot{s.N, d.TypeInt(), s.Off + 16}
-}
-func (d DummyFrontend) SplitComplex(s LocalSlot) (LocalSlot, LocalSlot) {
-	if s.Type.Size() == 16 {
-		return LocalSlot{s.N, d.TypeFloat64(), s.Off}, LocalSlot{s.N, d.TypeFloat64(), s.Off + 8}
+func testConfigArch(tb testing.TB, arch string) *Conf {
+	ctxt, ok := testCtxts[arch]
+	if !ok {
+		tb.Fatalf("unknown arch %s", arch)
 	}
-	return LocalSlot{s.N, d.TypeFloat32(), s.Off}, LocalSlot{s.N, d.TypeFloat32(), s.Off + 4}
-}
-func (d DummyFrontend) SplitStruct(s LocalSlot, i int) LocalSlot {
-	return LocalSlot{s.N, s.Type.FieldType(i), s.Off + s.Type.FieldOff(i)}
-}
-func (DummyFrontend) Line(line int32) string {
-	return "unknown.go:0"
+	if ctxt.Arch.PtrSize != 8 {
+		tb.Fatal("testTypes is 64-bit only")
+	}
+	c := &Conf{
+		config: NewConfig(arch, testTypes, ctxt, true, false),
+		tb:     tb,
+	}
+	return c
 }
 
-func (d DummyFrontend) Logf(msg string, args ...interface{}) { d.t.Logf(msg, args...) }
-func (d DummyFrontend) Log() bool                            { return true }
-
-func (d DummyFrontend) Fatalf(line int32, msg string, args ...interface{}) { d.t.Fatalf(msg, args...) }
-func (d DummyFrontend) Unimplementedf(line int32, msg string, args ...interface{}) {
-	d.t.Fatalf(msg, args...)
+type Conf struct {
+	config *Config
+	tb     testing.TB
+	fe     Frontend
 }
-func (d DummyFrontend) Warnl(line int32, msg string, args ...interface{}) { d.t.Logf(msg, args...) }
-func (d DummyFrontend) Debug_checknil() bool                              { return false }
 
-func (d DummyFrontend) TypeBool() Type    { return TypeBool }
-func (d DummyFrontend) TypeInt8() Type    { return TypeInt8 }
-func (d DummyFrontend) TypeInt16() Type   { return TypeInt16 }
-func (d DummyFrontend) TypeInt32() Type   { return TypeInt32 }
-func (d DummyFrontend) TypeInt64() Type   { return TypeInt64 }
-func (d DummyFrontend) TypeUInt8() Type   { return TypeUInt8 }
-func (d DummyFrontend) TypeUInt16() Type  { return TypeUInt16 }
-func (d DummyFrontend) TypeUInt32() Type  { return TypeUInt32 }
-func (d DummyFrontend) TypeUInt64() Type  { return TypeUInt64 }
-func (d DummyFrontend) TypeFloat32() Type { return TypeFloat32 }
-func (d DummyFrontend) TypeFloat64() Type { return TypeFloat64 }
-func (d DummyFrontend) TypeInt() Type     { return TypeInt64 }
-func (d DummyFrontend) TypeUintptr() Type { return TypeUInt64 }
-func (d DummyFrontend) TypeString() Type  { panic("unimplemented") }
-func (d DummyFrontend) TypeBytePtr() Type { return TypeBytePtr }
+func (c *Conf) Frontend() Frontend {
+	if c.fe == nil {
+		f := ir.NewFunc(src.NoXPos)
+		f.Nname = ir.NewNameAt(f.Pos(), &types.Sym{
+			Pkg:  types.NewPkg("my/import/path", "path"),
+			Name: "function",
+		})
+		f.LSym = &obj.LSym{Name: "my/import/path.function"}
 
-func (d DummyFrontend) CanSSA(t Type) bool {
-	// There are no un-SSAable types in dummy land.
+		c.fe = TestFrontend{
+			t:    c.tb,
+			ctxt: c.config.ctxt,
+			f:    f,
+		}
+	}
+	return c.fe
+}
+
+// TestFrontend is a test-only frontend.
+// It assumes 64 bit integers and pointers.
+type TestFrontend struct {
+	t    testing.TB
+	ctxt *obj.Link
+	f    *ir.Func
+}
+
+func (TestFrontend) StringData(s string) *obj.LSym {
+	return nil
+}
+func (TestFrontend) Auto(pos src.XPos, t *types.Type) *ir.Name {
+	n := ir.NewNameAt(pos, &types.Sym{Name: "aFakeAuto"})
+	n.SetType(t)
+	n.Class = ir.PAUTO
+	return n
+}
+func (d TestFrontend) SplitSlot(parent *LocalSlot, suffix string, offset int64, t *types.Type) LocalSlot {
+	return LocalSlot{N: parent.N, Type: t, Off: offset}
+}
+func (TestFrontend) AllocFrame(f *Func) {
+}
+func (d TestFrontend) Syslook(s string) *obj.LSym {
+	return d.ctxt.Lookup(s)
+}
+func (TestFrontend) UseWriteBarrier() bool {
+	return true // only writebarrier_test cares
+}
+
+func (d TestFrontend) Logf(msg string, args ...interface{}) { d.t.Logf(msg, args...) }
+func (d TestFrontend) Log() bool                            { return true }
+
+func (d TestFrontend) Fatalf(_ src.XPos, msg string, args ...interface{}) { d.t.Fatalf(msg, args...) }
+func (d TestFrontend) Warnl(_ src.XPos, msg string, args ...interface{})  { d.t.Logf(msg, args...) }
+func (d TestFrontend) Debug_checknil() bool                               { return false }
+
+func (d TestFrontend) MyImportPath() string {
+	return d.f.Sym().Pkg.Path
+}
+func (d TestFrontend) Func() *ir.Func {
+	return d.f
+}
+
+var testTypes Types
+
+func init() {
+	// TODO(mdempsky): Push into types.InitUniverse or typecheck.InitUniverse.
+	types.PtrSize = 8
+	types.RegSize = 8
+	types.MaxWidth = 1 << 50
+
+	typecheck.InitUniverse()
+	testTypes.SetTypPtrs()
+}
+
+func (d TestFrontend) DerefItab(sym *obj.LSym, off int64) *obj.LSym { return nil }
+
+func (d TestFrontend) CanSSA(t *types.Type) bool {
+	// There are no un-SSAable types in test land.
 	return true
 }

@@ -7,38 +7,69 @@ package net
 import (
 	"context"
 	"errors"
+	"internal/bytealg"
+	"internal/itoa"
 	"io"
 	"os"
 )
 
-func query(ctx context.Context, filename, query string, bufSize int) (res []string, err error) {
-	file, err := os.OpenFile(filename, os.O_RDWR, 0)
-	if err != nil {
-		return
-	}
-	defer file.Close()
+// cgoAvailable set to true to indicate that the cgo resolver
+// is available on Plan 9. Note that on Plan 9 the cgo resolver
+// does not actually use cgo.
+const cgoAvailable = true
 
-	_, err = file.Seek(0, io.SeekStart)
-	if err != nil {
-		return
-	}
-	_, err = file.WriteString(query)
-	if err != nil {
-		return
-	}
-	_, err = file.Seek(0, io.SeekStart)
-	if err != nil {
-		return
-	}
-	buf := make([]byte, bufSize)
-	for {
-		n, _ := file.Read(buf)
-		if n <= 0 {
-			break
+func query(ctx context.Context, filename, query string, bufSize int) (addrs []string, err error) {
+	queryAddrs := func() (addrs []string, err error) {
+		file, err := os.OpenFile(filename, os.O_RDWR, 0)
+		if err != nil {
+			return nil, err
 		}
-		res = append(res, string(buf[:n]))
+		defer file.Close()
+
+		_, err = file.Seek(0, io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+		_, err = file.WriteString(query)
+		if err != nil {
+			return nil, err
+		}
+		_, err = file.Seek(0, io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+		buf := make([]byte, bufSize)
+		for {
+			n, _ := file.Read(buf)
+			if n <= 0 {
+				break
+			}
+			addrs = append(addrs, string(buf[:n]))
+		}
+		return addrs, nil
 	}
-	return
+
+	type ret struct {
+		addrs []string
+		err   error
+	}
+
+	ch := make(chan ret, 1)
+	go func() {
+		addrs, err := queryAddrs()
+		ch <- ret{addrs: addrs, err: err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.addrs, r.err
+	case <-ctx.Done():
+		return nil, &DNSError{
+			Name:      query,
+			Err:       ctx.Err().Error(),
+			IsTimeout: ctx.Err() == context.DeadlineExceeded,
+		}
+	}
 }
 
 func queryCS(ctx context.Context, net, host, service string) (res []string, err error) {
@@ -59,7 +90,7 @@ func queryCS1(ctx context.Context, net string, ip IP, port int) (clone, dest str
 	if len(ip) != 0 && !ip.IsUnspecified() {
 		ips = ip.String()
 	}
-	lines, err := queryCS(ctx, net, ips, itoa(port))
+	lines, err := queryCS(ctx, net, ips, itoa.Itoa(port))
 	if err != nil {
 		return
 	}
@@ -111,18 +142,23 @@ func lookupProtocol(ctx context.Context, name string) (proto int, err error) {
 		return 0, UnknownNetworkError(name)
 	}
 	s := f[1]
-	if n, _, ok := dtoi(s, byteIndex(s, '=')+1); ok {
+	if n, _, ok := dtoi(s[bytealg.IndexByteString(s, '=')+1:]); ok {
 		return n, nil
 	}
 	return 0, UnknownNetworkError(name)
 }
 
-func lookupHost(ctx context.Context, host string) (addrs []string, err error) {
+func (*Resolver) lookupHost(ctx context.Context, host string) (addrs []string, err error) {
 	// Use netdir/cs instead of netdir/dns because cs knows about
 	// host names in local network (e.g. from /lib/ndb/local)
 	lines, err := queryCS(ctx, "net", host, "1")
 	if err != nil {
-		return
+		dnsError := &DNSError{Err: err.Error(), Name: host}
+		if stringsHasSuffix(err.Error(), "dns failure") {
+			dnsError.Err = errNoSuchHost.Error()
+			dnsError.IsNotFound = true
+		}
+		return nil, dnsError
 	}
 loop:
 	for _, line := range lines {
@@ -131,7 +167,7 @@ loop:
 			continue
 		}
 		addr := f[1]
-		if i := byteIndex(addr, '!'); i >= 0 {
+		if i := bytealg.IndexByteString(addr, '!'); i >= 0 {
 			addr = addr[:i] // remove port
 		}
 		if ParseIP(addr) == nil {
@@ -148,8 +184,32 @@ loop:
 	return
 }
 
-func lookupIP(ctx context.Context, host string) (addrs []IPAddr, err error) {
-	lits, err := lookupHost(ctx, host)
+// preferGoOverPlan9 reports whether the resolver should use the
+// "PreferGo" implementation rather than asking plan9 services
+// for the answers.
+func (r *Resolver) preferGoOverPlan9() bool {
+	_, _, res := r.preferGoOverPlan9WithOrderAndConf()
+	return res
+}
+
+func (r *Resolver) preferGoOverPlan9WithOrderAndConf() (hostLookupOrder, *dnsConfig, bool) {
+	order, conf := systemConf().hostLookupOrder(r, "") // name is unused
+
+	// TODO(bradfitz): for now we only permit use of the PreferGo
+	// implementation when there's a non-nil Resolver with a
+	// non-nil Dialer. This is a sign that they the code is trying
+	// to use their DNS-speaking net.Conn (such as an in-memory
+	// DNS cache) and they don't want to actually hit the network.
+	// Once we add support for looking the default DNS servers
+	// from plan9, though, then we can relax this.
+	return order, conf, order != hostLookupCgo && r != nil && r.Dial != nil
+}
+
+func (r *Resolver) lookupIP(ctx context.Context, network, host string) (addrs []IPAddr, err error) {
+	if r.preferGoOverPlan9() {
+		return r.goLookupIP(ctx, network, host)
+	}
+	lits, err := r.lookupHost(ctx, host)
 	if err != nil {
 		return
 	}
@@ -163,14 +223,14 @@ func lookupIP(ctx context.Context, host string) (addrs []IPAddr, err error) {
 	return
 }
 
-func lookupPort(ctx context.Context, network, service string) (port int, err error) {
+func (*Resolver) lookupPort(ctx context.Context, network, service string) (port int, err error) {
 	switch network {
 	case "tcp4", "tcp6":
 		network = "tcp"
 	case "udp4", "udp6":
 		network = "udp"
 	}
-	lines, err := queryCS(ctx, network, "127.0.0.1", service)
+	lines, err := queryCS(ctx, network, "127.0.0.1", toLower(service))
 	if err != nil {
 		return
 	}
@@ -183,18 +243,26 @@ func lookupPort(ctx context.Context, network, service string) (port int, err err
 		return 0, unknownPortError
 	}
 	s := f[1]
-	if i := byteIndex(s, '!'); i >= 0 {
+	if i := bytealg.IndexByteString(s, '!'); i >= 0 {
 		s = s[i+1:] // remove address
 	}
-	if n, _, ok := dtoi(s, 0); ok {
+	if n, _, ok := dtoi(s); ok {
 		return n, nil
 	}
 	return 0, unknownPortError
 }
 
-func lookupCNAME(ctx context.Context, name string) (cname string, err error) {
+func (r *Resolver) lookupCNAME(ctx context.Context, name string) (cname string, err error) {
+	if order, conf, preferGo := r.preferGoOverPlan9WithOrderAndConf(); preferGo {
+		return r.goLookupCNAME(ctx, name, order, conf)
+	}
+
 	lines, err := queryDNS(ctx, name, "cname")
 	if err != nil {
+		if stringsHasSuffix(err.Error(), "dns failure") || stringsHasSuffix(err.Error(), "resource does not exist; negrcode 0") {
+			cname = name + "."
+			err = nil
+		}
 		return
 	}
 	if len(lines) > 0 {
@@ -205,7 +273,10 @@ func lookupCNAME(ctx context.Context, name string) (cname string, err error) {
 	return "", errors.New("bad response from ndb/dns")
 }
 
-func lookupSRV(ctx context.Context, service, proto, name string) (cname string, addrs []*SRV, err error) {
+func (r *Resolver) lookupSRV(ctx context.Context, service, proto, name string) (cname string, addrs []*SRV, err error) {
+	if r.preferGoOverPlan9() {
+		return r.goLookupSRV(ctx, service, proto, name)
+	}
 	var target string
 	if service == "" && proto == "" {
 		target = name
@@ -221,20 +292,23 @@ func lookupSRV(ctx context.Context, service, proto, name string) (cname string, 
 		if len(f) < 6 {
 			continue
 		}
-		port, _, portOk := dtoi(f[4], 0)
-		priority, _, priorityOk := dtoi(f[3], 0)
-		weight, _, weightOk := dtoi(f[2], 0)
+		port, _, portOk := dtoi(f[4])
+		priority, _, priorityOk := dtoi(f[3])
+		weight, _, weightOk := dtoi(f[2])
 		if !(portOk && priorityOk && weightOk) {
 			continue
 		}
-		addrs = append(addrs, &SRV{absDomainName([]byte(f[5])), uint16(port), uint16(priority), uint16(weight)})
-		cname = absDomainName([]byte(f[0]))
+		addrs = append(addrs, &SRV{absDomainName(f[5]), uint16(port), uint16(priority), uint16(weight)})
+		cname = absDomainName(f[0])
 	}
 	byPriorityWeight(addrs).sort()
 	return
 }
 
-func lookupMX(ctx context.Context, name string) (mx []*MX, err error) {
+func (r *Resolver) lookupMX(ctx context.Context, name string) (mx []*MX, err error) {
+	if r.preferGoOverPlan9() {
+		return r.goLookupMX(ctx, name)
+	}
 	lines, err := queryDNS(ctx, name, "mx")
 	if err != nil {
 		return
@@ -244,15 +318,18 @@ func lookupMX(ctx context.Context, name string) (mx []*MX, err error) {
 		if len(f) < 4 {
 			continue
 		}
-		if pref, _, ok := dtoi(f[2], 0); ok {
-			mx = append(mx, &MX{absDomainName([]byte(f[3])), uint16(pref)})
+		if pref, _, ok := dtoi(f[2]); ok {
+			mx = append(mx, &MX{absDomainName(f[3]), uint16(pref)})
 		}
 	}
 	byPref(mx).sort()
 	return
 }
 
-func lookupNS(ctx context.Context, name string) (ns []*NS, err error) {
+func (r *Resolver) lookupNS(ctx context.Context, name string) (ns []*NS, err error) {
+	if r.preferGoOverPlan9() {
+		return r.goLookupNS(ctx, name)
+	}
 	lines, err := queryDNS(ctx, name, "ns")
 	if err != nil {
 		return
@@ -262,25 +339,31 @@ func lookupNS(ctx context.Context, name string) (ns []*NS, err error) {
 		if len(f) < 3 {
 			continue
 		}
-		ns = append(ns, &NS{absDomainName([]byte(f[2]))})
+		ns = append(ns, &NS{absDomainName(f[2])})
 	}
 	return
 }
 
-func lookupTXT(ctx context.Context, name string) (txt []string, err error) {
+func (r *Resolver) lookupTXT(ctx context.Context, name string) (txt []string, err error) {
+	if r.preferGoOverPlan9() {
+		return r.goLookupTXT(ctx, name)
+	}
 	lines, err := queryDNS(ctx, name, "txt")
 	if err != nil {
 		return
 	}
 	for _, line := range lines {
-		if i := byteIndex(line, '\t'); i >= 0 {
-			txt = append(txt, absDomainName([]byte(line[i+1:])))
+		if i := bytealg.IndexByteString(line, '\t'); i >= 0 {
+			txt = append(txt, line[i+1:])
 		}
 	}
 	return
 }
 
-func lookupAddr(ctx context.Context, addr string) (name []string, err error) {
+func (r *Resolver) lookupAddr(ctx context.Context, addr string) (name []string, err error) {
+	if order, conf, preferGo := r.preferGoOverPlan9WithOrderAndConf(); preferGo {
+		return r.goLookupPTR(ctx, addr, order, conf)
+	}
 	arpa, err := reverseaddr(addr)
 	if err != nil {
 		return
@@ -294,7 +377,13 @@ func lookupAddr(ctx context.Context, addr string) (name []string, err error) {
 		if len(f) < 3 {
 			continue
 		}
-		name = append(name, absDomainName([]byte(f[2])))
+		name = append(name, absDomainName(f[2]))
 	}
 	return
+}
+
+// concurrentThreadsLimit returns the number of threads we permit to
+// run concurrently doing DNS lookups.
+func concurrentThreadsLimit() int {
+	return 500
 }

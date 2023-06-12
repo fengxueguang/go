@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"io"
-	"io/ioutil"
 	"strings"
 	"testing"
 )
@@ -243,7 +242,7 @@ func TestStreams(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		data, err = ioutil.ReadAll(NewReader(bytes.NewReader(data)))
+		data, err = io.ReadAll(NewReader(bytes.NewReader(data)))
 		if tc.want == "fail" {
 			if err == nil {
 				t.Errorf("#%d (%s): got nil error, want non-nil", i, tc.desc)
@@ -266,7 +265,7 @@ func TestTruncatedStreams(t *testing.T) {
 
 	for i := 0; i < len(data)-1; i++ {
 		r := NewReader(strings.NewReader(data[:i]))
-		_, err := io.Copy(ioutil.Discard, r)
+		_, err := io.Copy(io.Discard, r)
 		if err != io.ErrUnexpectedEOF {
 			t.Errorf("io.Copy(%d) on truncated stream: got %v, want %v", i, err, io.ErrUnexpectedEOF)
 		}
@@ -281,6 +280,7 @@ func TestTruncatedStreams(t *testing.T) {
 //
 // See https://github.com/google/go-github/pull/317 for background.
 func TestReaderEarlyEOF(t *testing.T) {
+	t.Parallel()
 	testSizes := []int{
 		1, 2, 3, 4, 5, 6, 7, 8,
 		100, 1000, 10000, 100000,

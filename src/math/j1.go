@@ -39,7 +39,7 @@ package math
 //                      =  1/sqrt(2) * (sin(x) - cos(x))
 //              sin(x1) =  sin(x)cos(3pi/4)-cos(x)sin(3pi/4)
 //                      = -1/sqrt(2) * (sin(x) + cos(x))
-//         (To avoid cancelation, use
+//         (To avoid cancellation, use
 //              sin(x) +- cos(x) = -cos(2x)/(sin(x) -+ cos(x))
 //         to compute the worse one.)
 //
@@ -69,6 +69,7 @@ package math
 // J1 returns the order-one Bessel function of the first kind.
 //
 // Special cases are:
+//
 //	J1(±Inf) = 0
 //	J1(NaN) = NaN
 func J1(x float64) float64 {
@@ -147,6 +148,7 @@ func J1(x float64) float64 {
 // Y1 returns the order-one Bessel function of the second kind.
 //
 // Special cases are:
+//
 //	Y1(+Inf) = 0
 //	Y1(0) = -Inf
 //	Y1(x < 0) = NaN
@@ -197,7 +199,7 @@ func Y1(x float64) float64 {
 		//                 =  1/sqrt(2) * (sin(x) - cos(x))
 		//         sin(x0) = sin(x)cos(3pi/4)-cos(x)sin(3pi/4)
 		//                 = -1/sqrt(2) * (cos(x) + sin(x))
-		// To avoid cancelation, use
+		// To avoid cancellation, use
 		//     sin(x) +- cos(x) = -cos(2x)/(sin(x) -+ cos(x))
 		// to compute the worse one.
 
@@ -298,20 +300,20 @@ var p1S2 = [5]float64{
 }
 
 func pone(x float64) float64 {
-	var p [6]float64
-	var q [5]float64
+	var p *[6]float64
+	var q *[5]float64
 	if x >= 8 {
-		p = p1R8
-		q = p1S8
+		p = &p1R8
+		q = &p1S8
 	} else if x >= 4.5454 {
-		p = p1R5
-		q = p1S5
+		p = &p1R5
+		q = &p1S5
 	} else if x >= 2.8571 {
-		p = p1R3
-		q = p1S3
+		p = &p1R3
+		q = &p1S3
 	} else if x >= 2 {
-		p = p1R2
-		q = p1S2
+		p = &p1R2
+		q = &p1S2
 	}
 	z := 1 / (x * x)
 	r := p[0] + z*(p[1]+z*(p[2]+z*(p[3]+z*(p[4]+z*p[5]))))
@@ -401,19 +403,19 @@ var q1S2 = [6]float64{
 }
 
 func qone(x float64) float64 {
-	var p, q [6]float64
+	var p, q *[6]float64
 	if x >= 8 {
-		p = q1R8
-		q = q1S8
+		p = &q1R8
+		q = &q1S8
 	} else if x >= 4.5454 {
-		p = q1R5
-		q = q1S5
+		p = &q1R5
+		q = &q1S5
 	} else if x >= 2.8571 {
-		p = q1R3
-		q = q1S3
+		p = &q1R3
+		q = &q1S3
 	} else if x >= 2 {
-		p = q1R2
-		q = q1S2
+		p = &q1R2
+		q = &q1S2
 	}
 	z := 1 / (x * x)
 	r := p[0] + z*(p[1]+z*(p[2]+z*(p[3]+z*(p[4]+z*p[5]))))

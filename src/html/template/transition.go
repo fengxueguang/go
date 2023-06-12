@@ -23,9 +23,11 @@ var transitionFunc = [...]func(context, []byte) (context, int){
 	stateRCDATA:      tSpecialTagEnd,
 	stateAttr:        tAttr,
 	stateURL:         tURL,
+	stateSrcset:      tURL,
 	stateJS:          tJS,
 	stateJSDqStr:     tJSDelimited,
 	stateJSSqStr:     tJSDelimited,
+	stateJSBqStr:     tJSDelimited,
 	stateJSRegexp:    tJSDelimited,
 	stateJSBlockCmt:  tBlockCmt,
 	stateJSLineCmt:   tLineCmt,
@@ -105,14 +107,23 @@ func tTag(c context, s []byte) (context, int) {
 			err:   errorf(ErrBadHTML, nil, 0, "expected space, attr name, or end of tag, but got %q", s[i:]),
 		}, len(s)
 	}
-	switch attrType(string(s[i:j])) {
-	case contentTypeURL:
-		attr = attrURL
-	case contentTypeCSS:
-		attr = attrStyle
-	case contentTypeJS:
-		attr = attrScript
+
+	attrName := strings.ToLower(string(s[i:j]))
+	if c.element == elementScript && attrName == "type" {
+		attr = attrScriptType
+	} else {
+		switch attrType(attrName) {
+		case contentTypeURL:
+			attr = attrURL
+		case contentTypeCSS:
+			attr = attrStyle
+		case contentTypeJS:
+			attr = attrScript
+		case contentTypeSrcset:
+			attr = attrSrcset
+		}
 	}
+
 	if j == len(s) {
 		state = stateAttrName
 	} else {
@@ -149,10 +160,12 @@ func tAfterName(c context, s []byte) (context, int) {
 }
 
 var attrStartStates = [...]state{
-	attrNone:   stateAttr,
-	attrScript: stateJS,
-	attrStyle:  stateCSS,
-	attrURL:    stateURL,
+	attrNone:       stateAttr,
+	attrScript:     stateJS,
+	attrScriptType: stateAttr,
+	attrStyle:      stateCSS,
+	attrURL:        stateURL,
+	attrSrcset:     stateSrcset,
 }
 
 // tBeforeValue is the context transition function for stateBeforeValue.
@@ -238,11 +251,11 @@ func tAttr(c context, s []byte) (context, int) {
 
 // tURL is the context transition function for the URL state.
 func tURL(c context, s []byte) (context, int) {
-	if bytes.IndexAny(s, "#?") >= 0 {
+	if bytes.ContainsAny(s, "#?") {
 		c.urlPart = urlPartQueryOrFrag
 	} else if len(s) != eatWhiteSpace(s, 0) && c.urlPart == urlPartNone {
 		// HTML5 uses "Valid URL potentially surrounded by spaces" for
-		// attrs: http://www.w3.org/TR/html5/index.html#attributes-1
+		// attrs: https://www.w3.org/TR/html5/index.html#attributes-1
 		c.urlPart = urlPartPreQuery
 	}
 	return c, len(s)
@@ -250,7 +263,7 @@ func tURL(c context, s []byte) (context, int) {
 
 // tJS is the context transition function for the JS state.
 func tJS(c context, s []byte) (context, int) {
-	i := bytes.IndexAny(s, `"'/`)
+	i := bytes.IndexAny(s, "\"`'/")
 	if i == -1 {
 		// Entire input is non string, comment, regexp tokens.
 		c.jsCtx = nextJSCtx(s, c.jsCtx)
@@ -262,6 +275,8 @@ func tJS(c context, s []byte) (context, int) {
 		c.state, c.jsCtx = stateJSDqStr, jsCtxRegexp
 	case '\'':
 		c.state, c.jsCtx = stateJSSqStr, jsCtxRegexp
+	case '`':
+		c.state, c.jsCtx = stateJSBqStr, jsCtxRegexp
 	case '/':
 		switch {
 		case i+1 < len(s) && s[i+1] == '/':
@@ -291,6 +306,8 @@ func tJSDelimited(c context, s []byte) (context, int) {
 	switch c.state {
 	case stateJSSqStr:
 		specials = `\'`
+	case stateJSBqStr:
+		specials = "`\\"
 	case stateJSRegexp:
 		specials = `\/[]`
 	}
@@ -368,7 +385,7 @@ func tLineCmt(c context, s []byte) (context, int) {
 		// are supported by the 4 major browsers.
 		// This defines line comments as
 		//     LINECOMMENT ::= "//" [^\n\f\d]*
-		// since http://www.w3.org/TR/css3-syntax/#SUBTOK-nl defines
+		// since https://www.w3.org/TR/css3-syntax/#SUBTOK-nl defines
 		// newlines:
 		//     nl ::= #xA | #xD #xA | #xD | #xC
 	default:
@@ -380,7 +397,7 @@ func tLineCmt(c context, s []byte) (context, int) {
 		return c, len(s)
 	}
 	c.state = endState
-	// Per section 7.4 of EcmaScript 5 : http://es5.github.com/#x7.4
+	// Per section 7.4 of EcmaScript 5 : https://es5.github.io/#x7.4
 	// "However, the LineTerminator at the end of the line is not
 	// considered to be part of the single-line comment; it is
 	// recognized separately by the lexical grammar and becomes part

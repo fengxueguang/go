@@ -25,6 +25,13 @@ func ExampleInt_SetString() {
 	// Output: 420
 }
 
+func ExampleFloat_SetString() {
+	f := new(big.Float)
+	f.SetString("3.14159")
+	fmt.Println(f)
+	// Output: 3.14159
+}
+
 func ExampleRat_Scan() {
 	// The Scan function is rarely used directly;
 	// the fmt package recognizes it as an implementation of fmt.Scanner.
@@ -49,6 +56,19 @@ func ExampleInt_Scan() {
 		fmt.Println(i)
 	}
 	// Output: 18446744073709551617
+}
+
+func ExampleFloat_Scan() {
+	// The Scan function is rarely used directly;
+	// the fmt package recognizes it as an implementation of fmt.Scanner.
+	f := new(big.Float)
+	_, err := fmt.Sscan("1.19282e99", f)
+	if err != nil {
+		log.Println("error scanning value:", err)
+	} else {
+		fmt.Println(f)
+	}
+	// Output: 1.19282e+99
 }
 
 // This example demonstrates how to use big.Int to compute the smallest

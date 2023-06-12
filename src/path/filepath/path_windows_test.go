@@ -7,34 +7,16 @@ package filepath_test
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"internal/testenv"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strings"
-	"syscall"
 	"testing"
 )
-
-func init() {
-	tmpdir, err := ioutil.TempDir("", "symtest")
-	if err != nil {
-		panic("failed to create temp directory: " + err.Error())
-	}
-	defer os.RemoveAll(tmpdir)
-
-	err = os.Symlink("target", filepath.Join(tmpdir, "symlink"))
-	if err == nil {
-		return
-	}
-
-	err = err.(*os.LinkError).Err
-	switch err {
-	case syscall.EWINDOWS, syscall.ERROR_PRIVILEGE_NOT_HELD:
-		supportsSymlinks = false
-	}
-}
 
 func TestWinSplitListTestsAreValid(t *testing.T) {
 	comspec := os.Getenv("ComSpec")
@@ -52,15 +34,10 @@ func testWinSplitListTestIsValid(t *testing.T, ti int, tt SplitListTest,
 
 	const (
 		cmdfile             = `printdir.cmd`
-		perm    os.FileMode = 0700
+		perm    fs.FileMode = 0700
 	)
 
-	tmp, err := ioutil.TempDir("", "testWinSplitListTestIsValid")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
-	defer os.RemoveAll(tmp)
-
+	tmp := t.TempDir()
 	for i, d := range tt.result {
 		if d == "" {
 			continue
@@ -75,16 +52,19 @@ func testWinSplitListTestIsValid(t *testing.T, ti int, tt SplitListTest,
 			t.Errorf("%d,%d: %#q already exists", ti, i, d)
 			return
 		}
-		if err = os.MkdirAll(dd, perm); err != nil {
+		if err := os.MkdirAll(dd, perm); err != nil {
 			t.Errorf("%d,%d: MkdirAll(%#q) failed: %v", ti, i, dd, err)
 			return
 		}
 		fn, data := filepath.Join(dd, cmdfile), []byte("@echo "+d+"\r\n")
-		if err = ioutil.WriteFile(fn, data, perm); err != nil {
+		if err := os.WriteFile(fn, data, perm); err != nil {
 			t.Errorf("%d,%d: WriteFile(%#q) failed: %v", ti, i, fn, err)
 			return
 		}
 	}
+
+	// on some systems, SystemRoot is required for cmd to work
+	systemRoot := os.Getenv("SystemRoot")
 
 	for i, d := range tt.result {
 		if d == "" {
@@ -94,7 +74,7 @@ func testWinSplitListTestIsValid(t *testing.T, ti int, tt SplitListTest,
 		cmd := &exec.Cmd{
 			Path: comspec,
 			Args: []string{`/c`, cmdfile},
-			Env:  []string{`Path=` + tt.list},
+			Env:  []string{`Path=` + systemRoot + "/System32;" + tt.list, `SystemRoot=` + systemRoot},
 			Dir:  tmp,
 		}
 		out, err := cmd.CombinedOutput()
@@ -115,21 +95,57 @@ func testWinSplitListTestIsValid(t *testing.T, ti int, tt SplitListTest,
 	}
 }
 
+func TestWindowsEvalSymlinks(t *testing.T) {
+	testenv.MustHaveSymlink(t)
+
+	tmpDir := tempDirCanonical(t)
+
+	if len(tmpDir) < 3 {
+		t.Fatalf("tmpDir path %q is too short", tmpDir)
+	}
+	if tmpDir[1] != ':' {
+		t.Fatalf("tmpDir path %q must have drive letter in it", tmpDir)
+	}
+	test := EvalSymlinksTest{"test/linkabswin", tmpDir[:3]}
+
+	// Create the symlink farm using relative paths.
+	testdirs := append(EvalSymlinksTestDirs, test)
+	for _, d := range testdirs {
+		var err error
+		path := simpleJoin(tmpDir, d.path)
+		if d.dest == "" {
+			err = os.Mkdir(path, 0755)
+		} else {
+			err = os.Symlink(d.dest, path)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	path := simpleJoin(tmpDir, test.path)
+
+	testEvalSymlinks(t, path, test.dest)
+
+	testEvalSymlinksAfterChdir(t, path, ".", test.dest)
+
+	testEvalSymlinksAfterChdir(t,
+		path,
+		filepath.VolumeName(tmpDir)+".",
+		test.dest)
+
+	testEvalSymlinksAfterChdir(t,
+		simpleJoin(tmpDir, "test"),
+		simpleJoin("..", test.path),
+		test.dest)
+
+	testEvalSymlinksAfterChdir(t, tmpDir, test.path, test.dest)
+}
+
 // TestEvalSymlinksCanonicalNames verify that EvalSymlinks
 // returns "canonical" path names on windows.
 func TestEvalSymlinksCanonicalNames(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "evalsymlinkcanonical")
-	if err != nil {
-		t.Fatal("creating temp dir:", err)
-	}
-	defer os.RemoveAll(tmp)
-
-	// ioutil.TempDir might return "non-canonical" name.
-	cTmpName, err := filepath.EvalSymlinks(tmp)
-	if err != nil {
-		t.Errorf("EvalSymlinks(%q) error: %v", tmp, err)
-	}
-
+	ctmp := tempDirCanonical(t)
 	dirs := []string{
 		"test",
 		"test/dir",
@@ -138,7 +154,7 @@ func TestEvalSymlinksCanonicalNames(t *testing.T) {
 	}
 
 	for _, d := range dirs {
-		dir := filepath.Join(cTmpName, d)
+		dir := filepath.Join(ctmp, d)
 		err := os.Mkdir(dir, 0755)
 		if err != nil {
 			t.Fatal(err)
@@ -181,13 +197,17 @@ func TestEvalSymlinksCanonicalNames(t *testing.T) {
 // (where c: is vol parameter) to discover "8dot3 name creation state".
 // The state is combination of 2 flags. The global flag controls if it
 // is per volume or global setting:
-//   0 - Enable 8dot3 name creation on all volumes on the system
-//   1 - Disable 8dot3 name creation on all volumes on the system
-//   2 - Set 8dot3 name creation on a per volume basis
-//   3 - Disable 8dot3 name creation on all volumes except the system volume
+//
+//	0 - Enable 8dot3 name creation on all volumes on the system
+//	1 - Disable 8dot3 name creation on all volumes on the system
+//	2 - Set 8dot3 name creation on a per volume basis
+//	3 - Disable 8dot3 name creation on all volumes except the system volume
+//
 // If global flag is set to 2, then per-volume flag needs to be examined:
-//   0 - Enable 8dot3 name creation on this volume
-//   1 - Disable 8dot3 name creation on this volume
+//
+//	0 - Enable 8dot3 name creation on this volume
+//	1 - Disable 8dot3 name creation on this volume
+//
 // checkVolume8dot3Setting verifies that "8dot3 name creation" flags
 // are set to 2 and 0, if enabled parameter is true, or 2 and 1, if enabled
 // is false. Otherwise checkVolume8dot3Setting returns error.
@@ -327,11 +347,242 @@ func TestToNorm(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		got, err := filepath.ToNorm(test.arg, stubBase)
+		var path string
+		if test.arg != "" {
+			path = filepath.Clean(test.arg)
+		}
+		got, err := filepath.ToNorm(path, stubBase)
 		if err != nil {
-			t.Errorf("unexpected toNorm error, arg: %s, err: %v\n", test.arg, err)
+			t.Errorf("toNorm(%s) failed: %v\n", test.arg, err)
 		} else if got != test.want {
-			t.Errorf("toNorm error, arg: %s, want: %s, got: %s\n", test.arg, test.want, got)
+			t.Errorf("toNorm(%s) returns %s, but %s expected\n", test.arg, got, test.want)
+		}
+	}
+
+	testPath := `{{tmp}}\test\foo\bar`
+
+	testsDir := []struct {
+		wd   string
+		arg  string
+		want string
+	}{
+		// test absolute paths
+		{".", `{{tmp}}\test\foo\bar`, `{{tmp}}\test\foo\bar`},
+		{".", `{{tmp}}\.\test/foo\bar`, `{{tmp}}\test\foo\bar`},
+		{".", `{{tmp}}\test\..\test\foo\bar`, `{{tmp}}\test\foo\bar`},
+		{".", `{{tmp}}\TEST\FOO\BAR`, `{{tmp}}\test\foo\bar`},
+
+		// test relative paths begin with drive letter
+		{`{{tmp}}\test`, `{{tmpvol}}.`, `{{tmpvol}}.`},
+		{`{{tmp}}\test`, `{{tmpvol}}..`, `{{tmpvol}}..`},
+		{`{{tmp}}\test`, `{{tmpvol}}foo\bar`, `{{tmpvol}}foo\bar`},
+		{`{{tmp}}\test`, `{{tmpvol}}.\foo\bar`, `{{tmpvol}}foo\bar`},
+		{`{{tmp}}\test`, `{{tmpvol}}foo\..\foo\bar`, `{{tmpvol}}foo\bar`},
+		{`{{tmp}}\test`, `{{tmpvol}}FOO\BAR`, `{{tmpvol}}foo\bar`},
+
+		// test relative paths begin with '\'
+		{"{{tmp}}", `{{tmpnovol}}\test\foo\bar`, `{{tmpnovol}}\test\foo\bar`},
+		{"{{tmp}}", `{{tmpnovol}}\.\test\foo\bar`, `{{tmpnovol}}\test\foo\bar`},
+		{"{{tmp}}", `{{tmpnovol}}\test\..\test\foo\bar`, `{{tmpnovol}}\test\foo\bar`},
+		{"{{tmp}}", `{{tmpnovol}}\TEST\FOO\BAR`, `{{tmpnovol}}\test\foo\bar`},
+
+		// test relative paths begin without '\'
+		{`{{tmp}}\test`, ".", `.`},
+		{`{{tmp}}\test`, "..", `..`},
+		{`{{tmp}}\test`, `foo\bar`, `foo\bar`},
+		{`{{tmp}}\test`, `.\foo\bar`, `foo\bar`},
+		{`{{tmp}}\test`, `foo\..\foo\bar`, `foo\bar`},
+		{`{{tmp}}\test`, `FOO\BAR`, `foo\bar`},
+
+		// test UNC paths
+		{".", `\\localhost\c$`, `\\localhost\c$`},
+	}
+
+	ctmp := tempDirCanonical(t)
+	if err := os.MkdirAll(strings.ReplaceAll(testPath, "{{tmp}}", ctmp), 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := os.Chdir(cwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	tmpVol := filepath.VolumeName(ctmp)
+	if len(tmpVol) != 2 {
+		t.Fatalf("unexpected temp volume name %q", tmpVol)
+	}
+
+	tmpNoVol := ctmp[len(tmpVol):]
+
+	replacer := strings.NewReplacer("{{tmp}}", ctmp, "{{tmpvol}}", tmpVol, "{{tmpnovol}}", tmpNoVol)
+
+	for _, test := range testsDir {
+		wd := replacer.Replace(test.wd)
+		arg := replacer.Replace(test.arg)
+		want := replacer.Replace(test.want)
+
+		if test.wd == "." {
+			err := os.Chdir(cwd)
+			if err != nil {
+				t.Error(err)
+
+				continue
+			}
+		} else {
+			err := os.Chdir(wd)
+			if err != nil {
+				t.Error(err)
+
+				continue
+			}
+		}
+		if arg != "" {
+			arg = filepath.Clean(arg)
+		}
+		got, err := filepath.ToNorm(arg, filepath.NormBase)
+		if err != nil {
+			t.Errorf("toNorm(%s) failed: %v (wd=%s)\n", arg, err, wd)
+		} else if got != want {
+			t.Errorf("toNorm(%s) returns %s, but %s expected (wd=%s)\n", arg, got, want, wd)
+		}
+	}
+}
+
+func TestUNC(t *testing.T) {
+	// Test that this doesn't go into an infinite recursion.
+	// See golang.org/issue/15879.
+	defer debug.SetMaxStack(debug.SetMaxStack(1e6))
+	filepath.Glob(`\\?\c:\*`)
+}
+
+func testWalkMklink(t *testing.T, linktype string) {
+	output, _ := exec.Command("cmd", "/c", "mklink", "/?").Output()
+	if !strings.Contains(string(output), fmt.Sprintf(" /%s ", linktype)) {
+		t.Skipf(`skipping test; mklink does not supports /%s parameter`, linktype)
+	}
+	testWalkSymlink(t, func(target, link string) error {
+		output, err := exec.Command("cmd", "/c", "mklink", "/"+linktype, link, target).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf(`"mklink /%s %v %v" command failed: %v\n%v`, linktype, link, target, err, string(output))
+		}
+		return nil
+	})
+}
+
+func TestWalkDirectoryJunction(t *testing.T) {
+	testenv.MustHaveSymlink(t)
+	testWalkMklink(t, "J")
+}
+
+func TestWalkDirectorySymlink(t *testing.T) {
+	testenv.MustHaveSymlink(t)
+	testWalkMklink(t, "D")
+}
+
+func TestNTNamespaceSymlink(t *testing.T) {
+	output, _ := exec.Command("cmd", "/c", "mklink", "/?").Output()
+	if !strings.Contains(string(output), " /J ") {
+		t.Skip("skipping test because mklink command does not support junctions")
+	}
+
+	tmpdir := tempDirCanonical(t)
+
+	vol := filepath.VolumeName(tmpdir)
+	output, err := exec.Command("cmd", "/c", "mountvol", vol, "/L").CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to run mountvol %v /L: %v %q", vol, err, output)
+	}
+	target := strings.Trim(string(output), " \n\r")
+
+	dirlink := filepath.Join(tmpdir, "dirlink")
+	output, err = exec.Command("cmd", "/c", "mklink", "/J", dirlink, target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to run mklink %v %v: %v %q", dirlink, target, err, output)
+	}
+
+	got, err := filepath.EvalSymlinks(dirlink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := vol + `\`; got != want {
+		t.Errorf(`EvalSymlinks(%q): got %q, want %q`, dirlink, got, want)
+	}
+
+	// Make sure we have sufficient privilege to run mklink command.
+	testenv.MustHaveSymlink(t)
+
+	file := filepath.Join(tmpdir, "file")
+	err = os.WriteFile(file, []byte(""), 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target += file[len(filepath.VolumeName(file)):]
+
+	filelink := filepath.Join(tmpdir, "filelink")
+	output, err = exec.Command("cmd", "/c", "mklink", filelink, target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to run mklink %v %v: %v %q", filelink, target, err, output)
+	}
+
+	got, err = filepath.EvalSymlinks(filelink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := file; got != want {
+		t.Errorf(`EvalSymlinks(%q): got %q, want %q`, filelink, got, want)
+	}
+}
+
+func TestIssue52476(t *testing.T) {
+	tests := []struct {
+		lhs, rhs string
+		want     string
+	}{
+		{`..\.`, `C:`, `..\C:`},
+		{`..`, `C:`, `..\C:`},
+		{`.`, `:`, `.\:`},
+		{`.`, `C:`, `.\C:`},
+		{`.`, `C:/a/b/../c`, `.\C:\a\c`},
+		{`.`, `\C:`, `.\C:`},
+		{`C:\`, `.`, `C:\`},
+		{`C:\`, `C:\`, `C:\C:`},
+		{`C`, `:`, `C\:`},
+		{`\.`, `C:`, `\C:`},
+		{`\`, `C:`, `\C:`},
+	}
+
+	for _, test := range tests {
+		got := filepath.Join(test.lhs, test.rhs)
+		if got != test.want {
+			t.Errorf(`Join(%q, %q): got %q, want %q`, test.lhs, test.rhs, got, test.want)
+		}
+	}
+}
+
+func TestAbsWindows(t *testing.T) {
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{`C:\foo`, `C:\foo`},
+		{`\\host\share\foo`, `\\host\share\foo`},
+		{`\\host`, `\\host`},
+		{`\\.\NUL`, `\\.\NUL`},
+		{`NUL`, `\\.\NUL`},
+		{`COM1`, `\\.\COM1`},
+		{`a/NUL`, `\\.\NUL`},
+	} {
+		got, err := filepath.Abs(test.path)
+		if err != nil || got != test.want {
+			t.Errorf("Abs(%q) = %q, %v; want %q, nil", test.path, got, err, test.want)
 		}
 	}
 }

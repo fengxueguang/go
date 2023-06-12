@@ -35,10 +35,11 @@ func NewChunkedReader(r io.Reader) io.Reader {
 }
 
 type chunkedReader struct {
-	r   *bufio.Reader
-	n   uint64 // unread bytes in chunk
-	err error
-	buf [2]byte
+	r        *bufio.Reader
+	n        uint64 // unread bytes in chunk
+	err      error
+	buf      [2]byte
+	checkEnd bool // whether need to check for \r\n chunk footer
 }
 
 func (cr *chunkedReader) beginChunk() {
@@ -68,6 +69,26 @@ func (cr *chunkedReader) chunkHeaderAvailable() bool {
 
 func (cr *chunkedReader) Read(b []uint8) (n int, err error) {
 	for cr.err == nil {
+		if cr.checkEnd {
+			if n > 0 && cr.r.Buffered() < 2 {
+				// We have some data. Return early (per the io.Reader
+				// contract) instead of potentially blocking while
+				// reading more.
+				break
+			}
+			if _, cr.err = io.ReadFull(cr.r, cr.buf[:2]); cr.err == nil {
+				if string(cr.buf[:]) != "\r\n" {
+					cr.err = errors.New("malformed chunked encoding")
+					break
+				}
+			} else {
+				if cr.err == io.EOF {
+					cr.err = io.ErrUnexpectedEOF
+				}
+				break
+			}
+			cr.checkEnd = false
+		}
 		if cr.n == 0 {
 			if n > 0 && !cr.chunkHeaderAvailable() {
 				// We've read enough. Don't potentially block
@@ -92,11 +113,9 @@ func (cr *chunkedReader) Read(b []uint8) (n int, err error) {
 		// If we're at the end of a chunk, read the next two
 		// bytes to verify they are "\r\n".
 		if cr.n == 0 && cr.err == nil {
-			if _, cr.err = io.ReadFull(cr.r, cr.buf[:2]); cr.err == nil {
-				if cr.buf[0] != '\r' || cr.buf[1] != '\n' {
-					cr.err = errors.New("malformed chunked encoding")
-				}
-			}
+			cr.checkEnd = true
+		} else if cr.err == io.EOF {
+			cr.err = io.ErrUnexpectedEOF
 		}
 	}
 	return n, cr.err
@@ -140,26 +159,28 @@ func isASCIISpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
+var semi = []byte(";")
+
 // removeChunkExtension removes any chunk-extension from p.
 // For example,
-//     "0" => "0"
-//     "0;token" => "0"
-//     "0;token=val" => "0"
-//     `0;token="quoted string"` => "0"
+//
+//	"0" => "0"
+//	"0;token" => "0"
+//	"0;token=val" => "0"
+//	`0;token="quoted string"` => "0"
 func removeChunkExtension(p []byte) ([]byte, error) {
-	semi := bytes.IndexByte(p, ';')
-	if semi == -1 {
-		return p, nil
-	}
+	p, _, _ = bytes.Cut(p, semi)
 	// TODO: care about exact syntax of chunk extensions? We're
 	// ignoring and stripping them anyway. For now just never
 	// return an error.
-	return p[:semi], nil
+	return p, nil
 }
 
 // NewChunkedWriter returns a new chunkedWriter that translates writes into HTTP
 // "chunked" format before writing them to w. Closing the returned chunkedWriter
-// sends the final 0-length chunk that marks the end of the stream.
+// sends the final 0-length chunk that marks the end of the stream but does
+// not send the final CRLF that appears after trailers; trailers and the last
+// CRLF must be written separately.
 //
 // NewChunkedWriter is not needed by normal applications. The http
 // package adds chunking automatically if handlers don't set a

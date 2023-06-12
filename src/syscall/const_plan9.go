@@ -1,3 +1,7 @@
+// Copyright 2014 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package syscall
 
 // Plan 9 Constants
@@ -10,6 +14,17 @@ const (
 	O_TRUNC   = 16
 	O_CLOEXEC = 32
 	O_EXCL    = 0x1000
+)
+
+// Bind flags
+const (
+	MORDER  = 0x0003 // mask for bits defining order of mounting
+	MREPL   = 0x0000 // mount replaces object
+	MBEFORE = 0x0001 // mount goes before others in union directory
+	MAFTER  = 0x0002 // mount goes after others in union directory
+	MCREATE = 0x0004 // permit creation in mounted directory
+	MCACHE  = 0x0010 // cache some data
+	MMASK   = 0x0017 // all bits on
 )
 
 // Rfork flags

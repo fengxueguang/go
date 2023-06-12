@@ -4,13 +4,16 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/abi"
+	"internal/goarch"
+	"unsafe"
+)
 
 const (
 	_NSIG        = 33
 	_SI_USER     = 0
 	_SS_DISABLE  = 4
-	_RLIMIT_AS   = 10
 	_SIG_BLOCK   = 1
 	_SIG_UNBLOCK = 2
 	_SIG_SETMASK = 3
@@ -22,10 +25,10 @@ type mOS struct{}
 func lwp_create(param *lwpparams) int32
 
 //go:noescape
-func sigaltstack(new, old *sigaltstackt)
+func sigaltstack(new, old *stackt)
 
 //go:noescape
-func sigaction(sig int32, new, old *sigactiont)
+func sigaction(sig uint32, new, old *sigactiont)
 
 //go:noescape
 func sigprocmask(how int32, new, old *sigset)
@@ -36,11 +39,10 @@ func setitimer(mode int32, new, old *itimerval)
 //go:noescape
 func sysctl(mib *uint32, miblen uint32, out *byte, size *uintptr, dst *byte, ndst uintptr) int32
 
-//go:noescape
-func getrlimit(kind int32, limit unsafe.Pointer) int32
+func raiseproc(sig uint32)
 
-func raise(sig int32)
-func raiseproc(sig int32)
+func lwp_gettid() int32
+func lwp_kill(pid, tid int32, sig int)
 
 //go:noescape
 func sys_umtx_sleep(addr *uint32, val, timeout int32) int32
@@ -50,12 +52,26 @@ func sys_umtx_wakeup(addr *uint32, val int32) int32
 
 func osyield()
 
-const stackSystem = 0
+//go:nosplit
+func osyield_no_g() {
+	osyield()
+}
+
+func kqueue() int32
+
+//go:noescape
+func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32
+
+func pipe2(flags int32) (r, w int32, errno int32)
+func fcntl(fd, cmd, arg int32) (ret int32, errno int32)
+
+func issetugid() int32
 
 // From DragonFly's <sys/sysctl.h>
 const (
-	_CTL_HW  = 6
-	_HW_NCPU = 3
+	_CTL_HW      = 6
+	_HW_NCPU     = 3
+	_HW_PAGESIZE = 7
 )
 
 var sigset_all = sigset{[4]uint32{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)}}
@@ -69,6 +85,17 @@ func getncpu() int32 {
 		return int32(out)
 	}
 	return 1
+}
+
+func getPageSize() uintptr {
+	mib := [2]uint32{_CTL_HW, _HW_PAGESIZE}
+	out := uint32(0)
+	nout := unsafe.Sizeof(out)
+	ret := sysctl(&mib[0], 2, (*byte)(unsafe.Pointer(&out)), &nout, nil, 0)
+	if ret >= 0 {
+		return uintptr(out)
+	}
+	return 0
 }
 
 //go:nosplit
@@ -117,29 +144,38 @@ func futexwakeup(addr *uint32, cnt uint32) {
 func lwp_start(uintptr)
 
 // May run with m.p==nil, so write barriers are not allowed.
+//
 //go:nowritebarrier
-func newosproc(mp *m, stk unsafe.Pointer) {
+func newosproc(mp *m) {
+	stk := unsafe.Pointer(mp.g0.stack.hi)
 	if false {
-		print("newosproc stk=", stk, " m=", mp, " g=", mp.g0, " lwp_start=", funcPC(lwp_start), " id=", mp.id, " ostk=", &mp, "\n")
+		print("newosproc stk=", stk, " m=", mp, " g=", mp.g0, " lwp_start=", abi.FuncPCABI0(lwp_start), " id=", mp.id, " ostk=", &mp, "\n")
 	}
 
 	var oset sigset
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
 
 	params := lwpparams{
-		start_func: funcPC(lwp_start),
+		start_func: abi.FuncPCABI0(lwp_start),
 		arg:        unsafe.Pointer(mp),
 		stack:      uintptr(stk),
-		tid1:       unsafe.Pointer(&mp.procid),
+		tid1:       nil, // minit will record tid
 		tid2:       nil,
 	}
 
-	lwp_create(&params)
+	// TODO: Check for error.
+	retryOnEAGAIN(func() int32 {
+		lwp_create(&params)
+		return 0
+	})
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 }
 
 func osinit() {
 	ncpu = getncpu()
+	if physPageSize == 0 {
+		physPageSize = getPageSize()
+	}
 }
 
 var urandom_dev = []byte("/dev/urandom\x00")
@@ -163,88 +199,23 @@ func mpreinit(mp *m) {
 	mp.gsignal.m = mp
 }
 
-//go:nosplit
-func msigsave(mp *m) {
-	sigprocmask(_SIG_SETMASK, nil, &mp.sigmask)
-}
-
-//go:nosplit
-func msigrestore(sigmask sigset) {
-	sigprocmask(_SIG_SETMASK, &sigmask, nil)
-}
-
-//go:nosplit
-func sigblock() {
-	sigprocmask(_SIG_SETMASK, &sigset_all, nil)
-}
-
 // Called to initialize a new m (including the bootstrap m).
 // Called on the new thread, cannot allocate memory.
 func minit() {
-	_g_ := getg()
-
-	// m.procid is a uint64, but lwp_start writes an int32. Fix it up.
-	_g_.m.procid = uint64(*(*int32)(unsafe.Pointer(&_g_.m.procid)))
-
-	// Initialize signal handling.
-
-	// On DragonFly a thread created by pthread_create inherits
-	// the signal stack of the creating thread. We always create
-	// a new signal stack here, to avoid having two Go threads
-	// using the same signal stack. This breaks the case of a
-	// thread created in C that calls sigaltstack and then calls a
-	// Go function, because we will lose track of the C code's
-	// sigaltstack, but it's the best we can do.
-	signalstack(&_g_.m.gsignal.stack)
-	_g_.m.newSigstack = true
-
-	// restore signal mask from m.sigmask and unblock essential signals
-	nmask := _g_.m.sigmask
-	for i := range sigtable {
-		if sigtable[i].flags&_SigUnblock != 0 {
-			nmask.__bits[(i-1)/32] &^= 1 << ((uint32(i) - 1) & 31)
-		}
-	}
-	sigprocmask(_SIG_SETMASK, &nmask, nil)
+	getg().m.procid = uint64(lwp_gettid())
+	minitSignals()
 }
 
 // Called from dropm to undo the effect of an minit.
+//
 //go:nosplit
 func unminit() {
-	if getg().m.newSigstack {
-		signalstack(nil)
-	}
+	unminitSignals()
 }
 
-func memlimit() uintptr {
-	/*
-		                TODO: Convert to Go when something actually uses the result.
-
-				Rlimit rl;
-				extern byte runtime·text[], runtime·end[];
-				uintptr used;
-
-				if(runtime·getrlimit(RLIMIT_AS, &rl) != 0)
-					return 0;
-				if(rl.rlim_cur >= 0x7fffffff)
-					return 0;
-
-				// Estimate our VM footprint excluding the heap.
-				// Not an exact science: use size of binary plus
-				// some room for thread stacks.
-				used = runtime·end - runtime·text + (64<<20);
-				if(used >= rl.rlim_cur)
-					return 0;
-
-				// If there's not at least 16 MB left, we're probably
-				// not going to be able to do much. Treat as no limit.
-				rl.rlim_cur -= used;
-				if(rl.rlim_cur < (16<<20))
-					return 0;
-
-				return rl.rlim_cur - used;
-	*/
-	return 0
+// Called from exitm, but not from drop, to undo the effect of thread-owned
+// resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+func mdestroy(mp *m) {
 }
 
 func sigtramp()
@@ -257,15 +228,12 @@ type sigactiont struct {
 
 //go:nosplit
 //go:nowritebarrierrec
-func setsig(i int32, fn uintptr, restart bool) {
+func setsig(i uint32, fn uintptr) {
 	var sa sigactiont
-	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK
-	if restart {
-		sa.sa_flags |= _SA_RESTART
-	}
+	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTART
 	sa.sa_mask = sigset_all
-	if fn == funcPC(sighandler) {
-		fn = funcPC(sigtramp)
+	if fn == abi.FuncPCABIInternal(sighandler) { // abi.FuncPCABIInternal(sighandler) matches the callers in signal_unix.go
+		fn = abi.FuncPCABI0(sigtramp)
 	}
 	sa.sa_sigaction = fn
 	sigaction(i, &sa, nil)
@@ -273,44 +241,104 @@ func setsig(i int32, fn uintptr, restart bool) {
 
 //go:nosplit
 //go:nowritebarrierrec
-func setsigstack(i int32) {
+func setsigstack(i uint32) {
 	throw("setsigstack")
 }
 
 //go:nosplit
 //go:nowritebarrierrec
-func getsig(i int32) uintptr {
+func getsig(i uint32) uintptr {
 	var sa sigactiont
 	sigaction(i, nil, &sa)
-	if sa.sa_sigaction == funcPC(sigtramp) {
-		return funcPC(sighandler)
-	}
 	return sa.sa_sigaction
 }
 
+// setSignalstackSP sets the ss_sp field of a stackt.
+//
 //go:nosplit
-func signalstack(s *stack) {
-	var st sigaltstackt
-	if s == nil {
-		st.ss_flags = _SS_DISABLE
-	} else {
-		st.ss_sp = s.lo
-		st.ss_size = s.hi - s.lo
-		st.ss_flags = 0
-	}
-	sigaltstack(&st, nil)
+func setSignalstackSP(s *stackt, sp uintptr) {
+	s.ss_sp = sp
 }
 
 //go:nosplit
 //go:nowritebarrierrec
-func updatesigmask(m sigmask) {
-	var mask sigset
-	copy(mask.__bits[:], m[:])
-	sigprocmask(_SIG_SETMASK, &mask, nil)
+func sigaddset(mask *sigset, i int) {
+	mask.__bits[(i-1)/32] |= 1 << ((uint32(i) - 1) & 31)
 }
 
-func unblocksig(sig int32) {
-	var mask sigset
-	mask.__bits[(sig-1)/32] |= 1 << ((uint32(sig) - 1) & 31)
-	sigprocmask(_SIG_UNBLOCK, &mask, nil)
+func sigdelset(mask *sigset, i int) {
+	mask.__bits[(i-1)/32] &^= 1 << ((uint32(i) - 1) & 31)
+}
+
+//go:nosplit
+func (c *sigctxt) fixsigcode(sig uint32) {
+}
+
+func setProcessCPUProfiler(hz int32) {
+	setProcessCPUProfilerTimer(hz)
+}
+
+func setThreadCPUProfiler(hz int32) {
+	setThreadCPUProfilerHz(hz)
+}
+
+//go:nosplit
+func validSIGPROF(mp *m, c *sigctxt) bool {
+	return true
+}
+
+func sysargs(argc int32, argv **byte) {
+	n := argc + 1
+
+	// skip over argv, envp to get to auxv
+	for argv_index(argv, n) != nil {
+		n++
+	}
+
+	// skip NULL separator
+	n++
+
+	auxvp := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
+	pairs := sysauxv(auxvp[:])
+	auxv = auxvp[: pairs*2 : pairs*2]
+}
+
+const (
+	_AT_NULL   = 0
+	_AT_PAGESZ = 6
+)
+
+func sysauxv(auxv []uintptr) (pairs int) {
+	var i int
+	for i = 0; auxv[i] != _AT_NULL; i += 2 {
+		tag, val := auxv[i], auxv[i+1]
+		switch tag {
+		case _AT_PAGESZ:
+			physPageSize = val
+		}
+	}
+	return i / 2
+}
+
+// raise sends a signal to the calling thread.
+//
+// It must be nosplit because it is used by the signal handler before
+// it definitely has a Go stack.
+//
+//go:nosplit
+func raise(sig uint32) {
+	lwp_kill(-1, lwp_gettid(), int(sig))
+}
+
+func signalM(mp *m, sig int) {
+	lwp_kill(-1, int32(mp.procid), sig)
+}
+
+// sigPerThreadSyscall is only used on linux, so we assign a bogus signal
+// number.
+const sigPerThreadSyscall = 1 << 31
+
+//go:nosplit
+func runPerThreadSyscall() {
+	throw("runPerThreadSyscall only valid on linux")
 }

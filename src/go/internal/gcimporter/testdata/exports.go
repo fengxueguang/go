@@ -7,9 +7,7 @@
 
 package exports
 
-import (
-	"go/ast"
-)
+import "go/ast"
 
 // Issue 3682: Correctly read dotted identifiers from export data.
 const init1 = 0
@@ -17,14 +15,17 @@ const init1 = 0
 func init() {}
 
 const (
-	C0 int = 0
-	C1     = 3.14159265
-	C2     = 2.718281828i
-	C3     = -123.456e-789
-	C4     = +123.456E+789
-	C5     = 1234i
-	C6     = "foo\n"
-	C7     = `bar\n`
+	C0  int     = 0
+	C1          = 3.14159265
+	C2          = 2.718281828i
+	C3          = -123.456e-789
+	C4          = +123.456e+789
+	C5          = 1234i
+	C6          = "foo\n"
+	C7          = `bar\n`
+	C8          = 42
+	C9  int     = 42
+	C10 float64 = 42
 )
 
 type (
@@ -49,7 +50,7 @@ type (
 		_ *T10
 	}
 	T11 map[int]string
-	T12 interface{}
+	T12 any
 	T13 interface {
 		m1()
 		m2(int) float32
@@ -64,7 +65,7 @@ type (
 	T17 func(x int)
 	T18 func() float32
 	T19 func() (x float32)
-	T20 func(...interface{})
+	T20 func(...any)
 	T21 struct{ next *T21 }
 	T22 struct{ link *T23 }
 	T23 struct{ link *T22 }
@@ -77,13 +78,14 @@ type (
 
 var (
 	V0 int
-	V1 = -991.0
+	V1         = -991.0
+	V2 float32 = 1.2
 )
 
 func F1()         {}
 func F2(x int)    {}
 func F3() int     { return 0 }
 func F4() float32 { return 0 }
-func F5(a, b, c int, u, v, w struct{ x, y T1 }, more ...interface{}) (p, q, r chan<- T10)
+func F5(a, b, c int, u, v, w struct{ x, y T1 }, more ...any) (p, q, r chan<- T10)
 
 func (p *T1) M1()

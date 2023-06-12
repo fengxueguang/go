@@ -5,6 +5,7 @@
 package flate
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -15,10 +16,23 @@ const (
 	BestSpeed          = 1
 	BestCompression    = 9
 	DefaultCompression = -1
-	HuffmanOnly        = -2 // Disables match search and only does Huffman entropy reduction.
-	logWindowSize      = 15
-	windowSize         = 1 << logWindowSize
-	windowMask         = windowSize - 1
+
+	// HuffmanOnly disables Lempel-Ziv match searching and only performs Huffman
+	// entropy encoding. This mode is useful in compressing data that has
+	// already been compressed with an LZ style algorithm (e.g. Snappy or LZ4)
+	// that lacks an entropy encoder. Compression gains are achieved when
+	// certain bytes in the input stream occur more frequently than others.
+	//
+	// Note that HuffmanOnly produces a compressed output that is
+	// RFC 1951 compliant. That is, any valid DEFLATE decompressor will
+	// continue to be able to decompress this output.
+	HuffmanOnly = -2
+)
+
+const (
+	logWindowSize = 15
+	windowSize    = 1 << logWindowSize
+	windowMask    = windowSize - 1
 
 	// The LZ77 step produces a sequence of literal tokens and <length, offset>
 	// pair tokens. The offset is also known as distance. The underlying wire
@@ -71,9 +85,10 @@ type compressor struct {
 	bulkHasher func([]byte, []uint32)
 
 	// compression algorithm
-	fill func(*compressor, []byte) int // copy data to window
-	step func(*compressor)             // process window
-	sync bool                          // requesting flush
+	fill      func(*compressor, []byte) int // copy data to window
+	step      func(*compressor)             // process window
+	sync      bool                          // requesting flush
+	bestSpeed *deflateFast                  // Encoder for BestSpeed
 
 	// Input hash chains
 	// hashHead[hashValue] contains the largest inputIndex with the specified hash value
@@ -98,7 +113,6 @@ type compressor struct {
 	// deflate state
 	length         int
 	offset         int
-	hash           uint32
 	maxInsertIndex int
 	err            error
 
@@ -122,14 +136,17 @@ func (d *compressor) fillDeflate(b []byte) int {
 			delta := d.hashOffset - 1
 			d.hashOffset -= delta
 			d.chainHead -= delta
-			for i, v := range d.hashPrev {
+
+			// Iterate over slices instead of arrays to avoid copying
+			// the entire table onto the stack (Issue #18625).
+			for i, v := range d.hashPrev[:] {
 				if int(v) > delta {
 					d.hashPrev[i] = uint32(int(v) - delta)
 				} else {
 					d.hashPrev[i] = 0
 				}
 			}
-			for i, v := range d.hashHead {
+			for i, v := range d.hashHead[:] {
 				if int(v) > delta {
 					d.hashHead[i] = uint32(int(v) - delta)
 				} else {
@@ -193,18 +210,15 @@ func (d *compressor) fillWindow(b []byte) {
 
 		dst := d.hashMatch[:dstSize]
 		d.bulkHasher(toCheck, dst)
-		var newH uint32
 		for i, val := range dst {
 			di := i + index
-			newH = val
-			hh := &d.hashHead[newH&hashMask]
+			hh := &d.hashHead[val&hashMask]
 			// Get previous value with the same hash.
 			// Our chain should point to the previous value.
 			d.hashPrev[di&windowMask] = *hh
 			// Set the head of the hash chain to us.
 			*hh = uint32(di + d.hashOffset)
 		}
-		d.hash = newH
 	}
 	// Update window information.
 	d.windowEnd = n
@@ -283,7 +297,7 @@ func hash4(b []byte) uint32 {
 }
 
 // bulkHash4 will compute hashes using the same
-// algorithm as hash4
+// algorithm as hash4.
 func bulkHash4(b []byte, dst []uint32) {
 	if len(b) < minMatchLength {
 		return
@@ -333,12 +347,13 @@ func (d *compressor) encSpeed() {
 				d.err = d.w.err
 			}
 			d.windowEnd = 0
+			d.bestSpeed.reset()
 			return
 		}
 
 	}
 	// Encode the block.
-	d.tokens = encodeBestSpeed(d.tokens[:0], d.window[:d.windowEnd])
+	d.tokens = d.bestSpeed.encode(d.tokens[:0], d.window[:d.windowEnd])
 
 	// If we removed less than 1/16th, Huffman compress the block.
 	if len(d.tokens) > d.windowEnd-(d.windowEnd>>4) {
@@ -358,7 +373,6 @@ func (d *compressor) initDeflate() {
 	d.offset = 0
 	d.byteAvailable = false
 	d.index = 0
-	d.hash = 0
 	d.chainHead = -1
 	d.bulkHasher = bulkHash4
 }
@@ -369,9 +383,6 @@ func (d *compressor) deflate() {
 	}
 
 	d.maxInsertIndex = d.windowEnd - (minMatchLength - 1)
-	if d.index < d.maxInsertIndex {
-		d.hash = hash4(d.window[d.index : d.index+minMatchLength])
-	}
 
 Loop:
 	for {
@@ -404,8 +415,8 @@ Loop:
 		}
 		if d.index < d.maxInsertIndex {
 			// Update the hash
-			d.hash = hash4(d.window[d.index : d.index+minMatchLength])
-			hh := &d.hashHead[d.hash&hashMask]
+			hash := hash4(d.window[d.index : d.index+minMatchLength])
+			hh := &d.hashHead[hash&hashMask]
 			d.chainHead = int(*hh)
 			d.hashPrev[d.index&windowMask] = uint32(d.chainHead)
 			*hh = uint32(d.index + d.hashOffset)
@@ -447,17 +458,20 @@ Loop:
 				} else {
 					newIndex = d.index + prevLength - 1
 				}
-				for d.index++; d.index < newIndex; d.index++ {
-					if d.index < d.maxInsertIndex {
-						d.hash = hash4(d.window[d.index : d.index+minMatchLength])
+				index := d.index
+				for index++; index < newIndex; index++ {
+					if index < d.maxInsertIndex {
+						hash := hash4(d.window[index : index+minMatchLength])
 						// Get previous value with the same hash.
 						// Our chain should point to the previous value.
-						hh := &d.hashHead[d.hash&hashMask]
-						d.hashPrev[d.index&windowMask] = *hh
+						hh := &d.hashHead[hash&hashMask]
+						d.hashPrev[index&windowMask] = *hh
 						// Set the head of the hash chain to us.
-						*hh = uint32(d.index + d.hashOffset)
+						*hh = uint32(index + d.hashOffset)
 					}
 				}
+				d.index = index
+
 				if d.fastSkipHashing == skipNever {
 					d.byteAvailable = false
 					d.length = minMatchLength - 1
@@ -466,9 +480,6 @@ Loop:
 				// For matches this long, we don't bother inserting each individual
 				// item into the table.
 				d.index += d.length
-				if d.index < d.maxInsertIndex {
-					d.hash = hash4(d.window[d.index : d.index+minMatchLength])
-				}
 			}
 			if len(d.tokens) == maxFlateBlockTokens {
 				// The block includes the current character
@@ -506,10 +517,10 @@ func (d *compressor) fillStore(b []byte) int {
 }
 
 func (d *compressor) store() {
-	if d.windowEnd > 0 {
+	if d.windowEnd > 0 && (d.windowEnd == maxStoreBlockSize || d.sync) {
 		d.err = d.writeStoredBlock(d.window[:d.windowEnd])
+		d.windowEnd = 0
 	}
-	d.windowEnd = 0
 }
 
 // storeHuff compresses and stores the currently added data
@@ -571,6 +582,7 @@ func (d *compressor) init(w io.Writer, level int) (err error) {
 		d.window = make([]byte, maxStoreBlockSize)
 		d.fill = (*compressor).fillStore
 		d.step = (*compressor).encSpeed
+		d.bestSpeed = newDeflateFast()
 		d.tokens = make([]token, maxStoreBlockSize)
 	case level == DefaultCompression:
 		level = 6
@@ -596,6 +608,7 @@ func (d *compressor) reset(w io.Writer) {
 	case BestSpeed:
 		d.windowEnd = 0
 		d.tokens = d.tokens[:0]
+		d.bestSpeed.reset()
 	default:
 		d.chainHead = -1
 		for i := range d.hashHead {
@@ -610,12 +623,14 @@ func (d *compressor) reset(w io.Writer) {
 		d.tokens = d.tokens[:0]
 		d.length = minMatchLength - 1
 		d.offset = 0
-		d.hash = 0
 		d.maxInsertIndex = 0
 	}
 }
 
 func (d *compressor) close() error {
+	if d.err == errWriterClosed {
+		return nil
+	}
 	if d.err != nil {
 		return d.err
 	}
@@ -628,7 +643,11 @@ func (d *compressor) close() error {
 		return d.w.err
 	}
 	d.w.flush()
-	return d.w.err
+	if d.w.err != nil {
+		return d.w.err
+	}
+	d.err = errWriterClosed
+	return nil
 }
 
 // NewWriter returns a new Writer compressing data at the given level.
@@ -640,7 +659,6 @@ func (d *compressor) close() error {
 // Level -2 (HuffmanOnly) will use Huffman compression only, giving
 // a very fast compression for all types of input, but sacrificing considerable
 // compression efficiency.
-//
 //
 // If level is in the range [-2, 9] then the error returned will be nil.
 // Otherwise the error returned will be non-nil.
@@ -677,6 +695,8 @@ func (w *dictWriter) Write(b []byte) (n int, err error) {
 	return w.w.Write(b)
 }
 
+var errWriterClosed = errors.New("flate: closed writer")
+
 // A Writer takes data written to it and writes the compressed
 // form of that data to an underlying writer (see NewWriter).
 type Writer struct {
@@ -690,16 +710,18 @@ func (w *Writer) Write(data []byte) (n int, err error) {
 	return w.d.write(data)
 }
 
-// Flush flushes any pending compressed data to the underlying writer.
+// Flush flushes any pending data to the underlying writer.
 // It is useful mainly in compressed network protocols, to ensure that
 // a remote reader has enough data to reconstruct a packet.
 // Flush does not return until the data has been written.
+// Calling Flush when there is no pending data still causes the Writer
+// to emit a sync marker of at least 4 bytes.
 // If the underlying writer returns an error, Flush returns that error.
 //
 // In the terminology of the zlib library, Flush is equivalent to Z_SYNC_FLUSH.
 func (w *Writer) Flush() error {
 	// For more about flushing:
-	// http://www.bolet.org/~pornin/deflate-flush.html
+	// https://www.bolet.org/~pornin/deflate-flush.html
 	return w.d.syncFlush()
 }
 
@@ -712,7 +734,7 @@ func (w *Writer) Close() error {
 // the result of NewWriter or NewWriterDict called with dst
 // and w's level and dictionary.
 func (w *Writer) Reset(dst io.Writer) {
-	if dw, ok := w.d.w.w.(*dictWriter); ok {
+	if dw, ok := w.d.w.writer.(*dictWriter); ok {
 		// w was created with NewWriterDict
 		dw.w = dst
 		w.d.reset(dw)

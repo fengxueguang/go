@@ -6,8 +6,11 @@ package exec
 
 import (
 	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // ErrNotFound is the error resulting if a path search failed to find an executable file.
@@ -19,7 +22,7 @@ func chkStat(file string) error {
 		return err
 	}
 	if d.IsDir() {
-		return os.ErrPermission
+		return fs.ErrPermission
 	}
 	return nil
 }
@@ -46,79 +49,97 @@ func findExecutable(file string, exts []string) (string, error) {
 			return f, nil
 		}
 	}
-	return "", os.ErrNotExist
+	return "", fs.ErrNotExist
 }
 
-// LookPath searches for an executable binary named file
-// in the directories named by the PATH environment variable.
-// If file contains a slash, it is tried directly and the PATH is not consulted.
+// LookPath searches for an executable named file in the
+// directories named by the PATH environment variable.
 // LookPath also uses PATHEXT environment variable to match
 // a suitable candidate.
-// The result may be an absolute path or a path relative to the current directory.
+// If file contains a slash, it is tried directly and the PATH is not consulted.
+// Otherwise, on success, the result is an absolute path.
+//
+// In older versions of Go, LookPath could return a path relative to the current directory.
+// As of Go 1.19, LookPath will instead return that path along with an error satisfying
+// errors.Is(err, ErrDot). See the package documentation for more details.
 func LookPath(file string) (string, error) {
+	var exts []string
 	x := os.Getenv(`PATHEXT`)
-	if x == "" {
-		x = `.COM;.EXE;.BAT;.CMD`
-	}
-	exts := []string{}
-	for _, e := range strings.Split(strings.ToLower(x), `;`) {
-		if e == "" {
-			continue
+	if x != "" {
+		for _, e := range strings.Split(strings.ToLower(x), `;`) {
+			if e == "" {
+				continue
+			}
+			if e[0] != '.' {
+				e = "." + e
+			}
+			exts = append(exts, e)
 		}
-		if e[0] != '.' {
-			e = "." + e
-		}
-		exts = append(exts, e)
+	} else {
+		exts = []string{".com", ".exe", ".bat", ".cmd"}
 	}
+
 	if strings.ContainsAny(file, `:\/`) {
-		if f, err := findExecutable(file, exts); err == nil {
+		f, err := findExecutable(file, exts)
+		if err == nil {
 			return f, nil
-		} else {
-			return "", &Error{file, err}
 		}
+		return "", &Error{file, err}
 	}
-	if f, err := findExecutable(`.\`+file, exts); err == nil {
-		return f, nil
-	}
-	if pathenv := os.Getenv(`PATH`); pathenv != "" {
-		for _, dir := range splitList(pathenv) {
-			if f, err := findExecutable(dir+`\`+file, exts); err == nil {
+
+	// On Windows, creating the NoDefaultCurrentDirectoryInExePath
+	// environment variable (with any value or no value!) signals that
+	// path lookups should skip the current directory.
+	// In theory we are supposed to call NeedCurrentDirectoryForExePathW
+	// "as the registry location of this environment variable can change"
+	// but that seems exceedingly unlikely: it would break all users who
+	// have configured their environment this way!
+	// https://docs.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-needcurrentdirectoryforexepathw
+	// See also go.dev/issue/43947.
+	var (
+		dotf   string
+		dotErr error
+	)
+	if _, found := syscall.Getenv("NoDefaultCurrentDirectoryInExePath"); !found {
+		if f, err := findExecutable(filepath.Join(".", file), exts); err == nil {
+			if execerrdot.Value() == "0" {
+				execerrdot.IncNonDefault()
 				return f, nil
 			}
+			dotf, dotErr = f, &Error{file, ErrDot}
 		}
+	}
+
+	path := os.Getenv("path")
+	for _, dir := range filepath.SplitList(path) {
+		if f, err := findExecutable(filepath.Join(dir, file), exts); err == nil {
+			if dotErr != nil {
+				// https://go.dev/issue/53536: if we resolved a relative path implicitly,
+				// and it is the same executable that would be resolved from the explicit %PATH%,
+				// prefer the explicit name for the executable (and, likely, no error) instead
+				// of the equivalent implicit name with ErrDot.
+				//
+				// Otherwise, return the ErrDot for the implicit path as soon as we find
+				// out that the explicit one doesn't match.
+				dotfi, dotfiErr := os.Lstat(dotf)
+				fi, fiErr := os.Lstat(f)
+				if dotfiErr != nil || fiErr != nil || !os.SameFile(dotfi, fi) {
+					return dotf, dotErr
+				}
+			}
+
+			if !filepath.IsAbs(f) {
+				if execerrdot.Value() != "0" {
+					return f, &Error{file, ErrDot}
+				}
+				execerrdot.IncNonDefault()
+			}
+			return f, nil
+		}
+	}
+
+	if dotErr != nil {
+		return dotf, dotErr
 	}
 	return "", &Error{file, ErrNotFound}
-}
-
-func splitList(path string) []string {
-	// The same implementation is used in SplitList in path/filepath;
-	// consider changing path/filepath when changing this.
-
-	if path == "" {
-		return []string{}
-	}
-
-	// Split path, respecting but preserving quotes.
-	list := []string{}
-	start := 0
-	quo := false
-	for i := 0; i < len(path); i++ {
-		switch c := path[i]; {
-		case c == '"':
-			quo = !quo
-		case c == os.PathListSeparator && !quo:
-			list = append(list, path[start:i])
-			start = i + 1
-		}
-	}
-	list = append(list, path[start:])
-
-	// Remove quotes.
-	for i, s := range list {
-		if strings.Contains(s, `"`) {
-			list[i] = strings.Replace(s, `"`, "", -1)
-		}
-	}
-
-	return list
 }

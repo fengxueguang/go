@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"crypto/tls"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 )
@@ -35,6 +34,9 @@ import (
 //
 // NewRequest panics on error for ease of use in testing, where a
 // panic is acceptable.
+//
+// To generate a client HTTP request instead of a server request, see
+// the NewRequest function in the net/http package.
 func NewRequest(method, target string, body io.Reader) *http.Request {
 	if method == "" {
 		method = "GET"
@@ -63,7 +65,7 @@ func NewRequest(method, target string, body io.Reader) *http.Request {
 		if rc, ok := body.(io.ReadCloser); ok {
 			req.Body = rc
 		} else {
-			req.Body = ioutil.NopCloser(body)
+			req.Body = io.NopCloser(body)
 		}
 	}
 
